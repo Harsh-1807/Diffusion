@@ -1,0 +1,1072 @@
+# -*- coding: utf-8 -*-
+# EvalCorrDiff_Singapore_v4.py  (fixed v2)
+#
+# Changes vs previous fix:
+#   [C1]  PSD: second curve is now coarse LR upsampled input (not regressor mu).
+#   [C2]  PCC figures: pure gaussian_kde only (no histogram fallback).
+#   [C3]  All error panels: pure signed error (pred - gt), symmetric diverging
+#         cmap; no abs() anywhere in the error display path.
+#   [C4]  main: regressor / s1 evaluation paths removed; lr_up_mm collected
+#         for PSD; Singapore map is the primary visual focus.
+
+import os
+import math
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.lines import Line2D
+import matplotlib.gridspec as gridspec
+from scipy.stats import pearsonr
+from scipy.stats import gaussian_kde
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+
+import geopandas as gpd
+import xarray as xr
+import pandas as pd
+
+from Dataset import ClimateDataset
+from Network import DiffusionUNet
+from Regressor import ClimateRegressor
+from shapely.geometry import Point
+
+# =============================================================================
+# PATHS
+# =============================================================================
+
+LR_FILES = [
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/LR_DATA_32/huss_rcm_8km_daily_data_1995-2014_32km.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/LR_DATA_32/mslp_rcm_8km_daily_data_1995-2014_32km.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/LR_DATA_32/tas_rcm_8km_daily_data_1995-2014_32km.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/LR_DATA_32/precip_rcm_8km_daily_data_1995-2014_32km.nc",
+]
+
+HR_FILES = [
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/HR_DATA_8/huss_rcm_8km_daily_data_1995-2014.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/HR_DATA_8/mslp_rcm_8km_daily_data_1995-2014.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/HR_DATA_8/tas_rcm_8km_daily_data_1995-2014.nc",
+    "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/HR_DATA_8/precip_rcm_8km_daily_data_1995-2014.nc",
+]
+
+BEST_CKPT = ("/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/CorrDiff/version11/corrdiff_singapore_v7_best.pth")
+REG_CKPT  = "regressor.pth"
+SHAPEFILE = ("/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/"
+             "ShapeFiles/singapore_Singapore_Country_Boundary.shp")
+             
+             
+# Add this right after SHAPEFILE definition
+WORLD_COUNTRIES_SHP = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/ShapeFiles/ne_10m_admin_0_countries/ne_10m_admin_0_countries.shp"
+
+OUTPUT_DIR = "./plots"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PRECIP_CH   = 3
+N_CH        = 4
+N_QUANTILES = 500
+N_INFER     = 50
+_RHO        = 5.0
+
+CENTER_LAT = 1.3
+CENTER_LON = 103.8
+HALF_SIZE  = 0.5
+
+SG_LON_MIN = CENTER_LON - HALF_SIZE
+SG_LON_MAX = CENTER_LON + HALF_SIZE
+SG_LAT_MIN = CENTER_LAT - HALF_SIZE
+SG_LAT_MAX = CENTER_LAT + HALF_SIZE
+
+TEXT  = "black"
+BG    = "white"
+GRID  = "gray"
+SUB   = "black"
+PANEL = "white"
+
+
+# =============================================================================
+# [BF1] COLOURMAP  -- fixed 'error' branch (was referencing undefined vars)
+# =============================================================================
+def make_dynamic_cmap(vmax, n_levels=9, kind="rain",
+                      vmin=None):
+    """
+    Dynamic discretized colormap with robust bounds.
+
+    Parameters
+    ----------
+    vmax      : upper bound (also used as +/- symmetric limit for 'error')
+    n_levels  : number of discrete colour bins
+    kind      : 'rain'  -> jet colormap, bounds [0, vmax]
+                'error' -> diverging white-to-red, bounds [-vmax, +vmax]
+                           (symmetric; pass vmin to override lower bound)
+    vmin      : explicit lower bound override (default: 0 for rain, -vmax for error)
+
+    Returns
+    -------
+    cmap, norm, bounds
+    """
+    vmax = max(float(vmax), 1e-6)
+
+    if kind == "rain":
+        # --- precipitation: [0, vmax] with nice step ---
+        raw_step  = vmax / max(n_levels - 1, 1)
+        magnitude = 10 ** math.floor(math.log10(max(raw_step, 1e-9)))
+        step      = magnitude * round(raw_step / magnitude)
+        if step <= 0:
+            step = raw_step
+
+        lo = 0.0 if vmin is None else float(vmin)
+        bounds = np.arange(lo, vmax + step, step)
+        if bounds[-1] < vmax:
+            bounds = np.append(bounds, bounds[-1] + step)
+        bounds = np.round(bounds, 6)
+
+        cmap = plt.get_cmap("jet", len(bounds) - 1)
+
+    else:
+        # --- error / bias: symmetric [-vmax, +vmax] ---
+        lo = -vmax if vmin is None else float(vmin)
+        hi = +vmax
+        bounds = np.linspace(lo, hi, n_levels + 1)   # [BF1] was using undefined err_vmin/err_vmax
+
+        base_colors = [
+            "#2166AC", "#4393C3", "#92C5DE", "#D1E5F0",
+            "#FFFFFF",
+            "#FDDBC7", "#F4A582", "#D6604D", "#B2182B",
+        ]
+        n_bins = len(bounds) - 1
+        if n_bins <= len(base_colors):
+            colors = base_colors[:n_bins]
+        else:
+            cmap_base = ListedColormap(base_colors)
+            colors = [cmap_base(t) for t in np.linspace(0, 1, n_bins)]
+
+        cmap = ListedColormap(colors, name="dynamic_error")
+
+    norm = BoundaryNorm(bounds, cmap.N, clip=True)
+    return cmap, norm, bounds
+
+
+# =============================================================================
+# EMBEDDING FRAMEWORK  (unchanged)
+# =============================================================================
+def create_sg_mask(lat, lon, shp):
+    H, W = len(lat), len(lon)
+    mask = np.zeros((H, W), dtype=bool)
+    geom = shp.unary_union
+    for i in range(H):
+        for j in range(W):
+            if geom.contains(Point(lon[j], lat[i])):
+                mask[i, j] = True
+    return mask
+
+
+def _cosine_betas(n_steps, device):
+    t      = torch.linspace(0, 1, n_steps + 1, device=device)
+    alphas = torch.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+    alphas = alphas / alphas[0]
+    betas  = (1 - alphas[1:] / alphas[:-1]).clamp(max=0.999)
+    return betas
+
+
+def _apply_noise_steps(field, betas, n_steps):
+    x = field.clone()
+    for t in range(min(n_steps, len(betas))):
+        noise = torch.randn_like(x)
+        x = (1.0 - betas[t]).sqrt() * x + betas[t].sqrt() * noise
+    return x
+
+
+class EmbeddingFramework:
+    def __init__(self, device):
+        self.device        = device
+        self.s_freq        = 0.25
+        self.n_noise_steps = 50
+        self.scale_factor  = 4
+        self.qdm_lr        = [None] * N_CH
+        self.qdm_hr        = [None] * N_CH
+        self._fitted       = False
+        self.betas         = _cosine_betas(self.n_noise_steps, device)
+
+    def load_state_dict(self, d):
+        self.s_freq        = d["s_freq"]
+        self.n_noise_steps = d["n_noise_steps"]
+        self.scale_factor  = d["scale_factor"]
+        self.qdm_lr        = d["qdm_lr"]
+        self.qdm_hr        = d["qdm_hr"]
+        self._fitted       = d["fitted"]
+        self.betas         = _cosine_betas(self.n_noise_steps, self.device)
+
+    def _determine_noise_steps(self):
+        steps = int(self.s_freq * 2.0 * self.n_noise_steps)
+        return max(5, min(steps, self.n_noise_steps))
+
+    def _apply_qdm_channel(self, field_ch, ch):
+        arr    = field_ch.cpu().numpy()
+        mapped = np.interp(arr, self.qdm_lr[ch], self.qdm_hr[ch])
+        return torch.tensor(mapped, dtype=field_ch.dtype, device=self.device)
+
+    def g(self, lr_field, hr_size):
+        if not self._fitted:
+            raise RuntimeError("EmbeddingFramework not loaded from checkpoint.")
+        B, C       = lr_field.shape[:2]
+        H_hr, W_hr = hr_size
+        lr_qdm = torch.empty(B, C, *lr_field.shape[2:],
+                             dtype=lr_field.dtype, device=self.device)
+        for ch in range(C):
+            lr_qdm[:, ch] = self._apply_qdm_channel(lr_field[:, ch], ch)
+        lr_up   = F.interpolate(lr_qdm, size=(H_hr, W_hr),
+                                mode="bilinear", align_corners=False)
+        n_steps = self._determine_noise_steps()
+        return _apply_noise_steps(lr_up, self.betas, n_steps)
+
+
+# =============================================================================
+# MODEL  (unchanged)
+# =============================================================================
+
+def get_sigma_schedule(n_steps, device, sigma_min, sigma_max, rho):
+    steps  = torch.arange(n_steps + 1, device=device)
+    t      = steps / n_steps
+    sigmas = (sigma_max**(1/rho) + t*(sigma_min**(1/rho) - sigma_max**(1/rho)))**rho
+    return sigmas.clamp(min=0.0)
+
+
+def edm_precond(sigma, sigma_data):
+    sigma   = sigma.reshape(-1, 1, 1, 1)
+    c_skip  = sigma_data**2 / (sigma**2 + sigma_data**2)
+    c_out   = sigma * sigma_data / (sigma**2 + sigma_data**2).sqrt()
+    c_in    = 1.0 / (sigma_data**2 + sigma**2).sqrt()
+    c_noise = sigma.flatten().log() / 4.0
+    return c_skip, c_out, c_in, c_noise
+
+
+class SingaporeCorrDiffNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = DiffusionUNet(in_channels=12, out_channels=4)
+
+    def forward(self, x, t):
+        H_in, W_in = x.shape[-2], x.shape[-1]
+        out = self.net(x, t)
+        if out.shape[-2:] != (H_in, W_in):
+            out = F.interpolate(out, size=(H_in, W_in),
+                                mode="bilinear", align_corners=False)
+        return out
+
+
+class SingaporeCorrDiffModel(nn.Module):
+    def __init__(self, diffusion_net, regressor,
+                 sigma_data, sigma_min, sigma_max, rho=_RHO):
+        super().__init__()
+        self.diffusion_net = diffusion_net
+        self.regressor     = regressor
+        self.sigma_data    = sigma_data
+        self.sigma_min     = sigma_min
+        self.sigma_max     = sigma_max
+        self.rho           = rho
+        for p in self.regressor.parameters():
+            p.requires_grad_(False)
+
+    def get_mu(self, lr):
+        with torch.no_grad():
+            return self.regressor(lr)
+
+    def _mu_at_size(self, lr, H, W):
+        mu = self.get_mu(lr)
+        if mu.shape[-2:] != (H, W):
+            mu = F.interpolate(mu, size=(H, W),
+                               mode="bilinear", align_corners=False)
+        return mu
+
+    @torch.no_grad()
+    def sample(self, lr, n_steps=50, embedding_fw=None):
+        H_hr = lr.shape[-2] * 4
+        W_hr = lr.shape[-1] * 4
+        mu   = self._mu_at_size(lr, H_hr, W_hr)
+
+        if embedding_fw is not None:
+            cond_ch = embedding_fw.g(lr, hr_size=(H_hr, W_hr))
+        else:
+            cond_ch = F.interpolate(lr, size=(H_hr, W_hr),
+                                    mode="bilinear", align_corners=False)
+
+        static_cond = torch.cat([mu, cond_ch], dim=1)
+        sigmas      = get_sigma_schedule(n_steps, lr.device,
+                                         self.sigma_min, self.sigma_max, self.rho)
+        x = torch.randn_like(mu) * sigmas[0].clamp(min=1e-5)
+
+        def denoise(x_in, sig):
+            sig_b          = sig.expand(lr.size(0))
+            inp            = torch.cat([x_in, static_cond], dim=1)
+            cs, co, ci, cn = edm_precond(sig_b, self.sigma_data)
+            Fx             = self.diffusion_net(ci * inp, cn)
+            return cs * x_in + co * Fx
+
+        for i in range(n_steps):
+            sc  = sigmas[i].clamp(min=1e-5)
+            sn  = sigmas[i + 1].clamp(min=1e-5)
+            Dx  = denoise(x, sc)
+            d   = (x - Dx) / sc
+            if i == n_steps - 1:
+                x = Dx
+            else:
+                xn  = x + (sn - sc) * d
+                Dx2 = denoise(xn, sn)
+                d2  = (xn - Dx2) / sn
+                x   = x + (sn - sc) * (d + d2) * 0.5
+
+        return mu + x
+
+
+def _torch_load(path, device):
+    import numpy as np
+    import numpy._core.multiarray
+
+    _NP_SAFE_GLOBALS = [
+        np.ndarray,
+        np.dtype,
+        numpy._core.multiarray._reconstruct,
+        numpy._core.multiarray.scalar,
+    ]
+
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except Exception:
+        pass
+
+    try:
+        with torch.serialization.safe_globals(_NP_SAFE_GLOBALS):
+            return torch.load(path, map_location=device, weights_only=True)
+    except Exception:
+        pass
+
+    print(f"  Warning: loading {path} with weights_only=False")
+    return torch.load(path, map_location=device, weights_only=False)
+
+
+def load_model(device):
+    ckpt = _torch_load(BEST_CKPT, device)
+
+    sigma_data = ckpt.get("sigma_data", 0.61)
+    sigma_min  = ckpt.get("sigma_min",  sigma_data * 0.01)
+    sigma_max  = ckpt.get("sigma_max",  sigma_data * 6.0)
+
+    reg = ClimateRegressor().to(device)
+    reg.load_state_dict(_torch_load(REG_CKPT, device))
+    reg.eval()
+
+    dnet  = SingaporeCorrDiffNet().to(device)
+    model = SingaporeCorrDiffModel(dnet, reg, sigma_data, sigma_min, sigma_max).to(device)
+
+    raw = (ckpt.get("model_state_dict") or ckpt.get("model") or
+           ckpt.get("state_dict") or ckpt)
+    clean = {(k[7:] if k.startswith("module.") else k): v for k, v in raw.items()}
+    missing, unexpected = model.diffusion_net.load_state_dict(clean, strict=False)
+    print(f"Model loaded  |  missing={len(missing)}  unexpected={len(unexpected)}")
+    print(f"  sigma_data={sigma_data:.4f}  sigma_min={sigma_min:.4f}  sigma_max={sigma_max:.4f}")
+
+    embedding_fw = None
+    emb_state    = ckpt.get("embedding_state", None)
+    use_emb      = ckpt.get("use_embedding", False)
+
+    if use_emb and emb_state is not None and emb_state.get("fitted", False):
+        embedding_fw = EmbeddingFramework(device)
+        embedding_fw.load_state_dict(emb_state)
+        print(f"  EmbeddingFramework loaded: s_freq={embedding_fw.s_freq:.4f}  "
+              f"noise_steps={embedding_fw._determine_noise_steps()}")
+    else:
+        print("  No embedding_state in checkpoint -- using raw lr_up (v2 mode).")
+
+    model.eval()
+    return model, embedding_fw
+
+
+# =============================================================================
+# GEO  (unchanged)
+# =============================================================================
+
+# =============================================================================
+# GEO
+# =============================================================================
+def load_geo():
+    try:
+        ds = xr.open_dataset(HR_FILES[3])
+        lat_name = next((c for c in ["lat","latitude","LAT","LATITUDE","y"]
+                         if c in ds.coords or c in ds.dims), None)
+        lon_name = next((c for c in ["lon","longitude","LON","LONGITUDE","x"]
+                         if c in ds.coords or c in ds.dims), None)
+        lat = ds[lat_name].values.astype(float) if lat_name else None
+        lon = ds[lon_name].values.astype(float) if lon_name else None
+        ds.close()
+    except Exception:
+        lat, lon = None, None
+
+    if lat is None: lat = np.linspace(-2.0, 4.5, 256)
+    if lon is None: lon = np.linspace(100.5, 107.0, 276)
+
+    # Singapore boundary (your original)
+    shp = None
+    if os.path.exists(SHAPEFILE):
+        shp = gpd.read_file(SHAPEFILE)
+        shp = (shp.set_crs("EPSG:4326") if shp.crs is None
+               else shp.to_crs("EPSG:4326"))
+        print(f"Loaded Singapore boundary shapefile")
+
+    # === NEW: Load all world countries ===
+    world = None
+    if os.path.exists(WORLD_COUNTRIES_SHP):
+        try:
+            world = gpd.read_file(WORLD_COUNTRIES_SHP)
+            world = world.to_crs("EPSG:4326")
+            print(f"✅ Loaded {len(world)} countries from Natural Earth (10m resolution)")
+        except Exception as e:
+            print(f"Warning: Could not load world countries: {e}")
+    else:
+        print(f"Warning: World countries shapefile not found at {WORLD_COUNTRIES_SHP}")
+
+    full_ext = [float(lon.min()), float(lon.max()),
+                float(lat.min()), float(lat.max())]
+    clip_ext = [SG_LON_MIN, SG_LON_MAX, SG_LAT_MIN, SG_LAT_MAX]
+
+    return lat, lon, full_ext, clip_ext, shp, world   # <-- Now returns 6 values
+
+def clip_field(field, lat, lon, extent):
+    lon_min, lon_max, lat_min, lat_max = extent
+    lat_idx = np.where((lat >= lat_min) & (lat <= lat_max))[0]
+    lon_idx = np.where((lon >= lon_min) & (lon <= lon_max))[0]
+    if len(lat_idx) == 0 or len(lon_idx) == 0:
+        return field, lat, lon
+    r0, r1 = lat_idx[0], lat_idx[-1]+1
+    c0, c1 = lon_idx[0], lon_idx[-1]+1
+    return field[r0:r1, c0:c1], lat[r0:r1], lon[c0:c1]
+
+
+def expand_extent(extent, expand_deg=1.0):
+    lon_min, lon_max, lat_min, lat_max = extent
+    return [lon_min - expand_deg, lon_max + expand_deg,
+            lat_min - expand_deg, lat_max + expand_deg]
+
+
+def to_mm(arr_norm, mean, std):
+    """Invert log1p normalisation: x_mm = expm1(arr_norm * std + mean)."""
+    x_log = arr_norm * std + mean
+    return np.expm1(x_log)
+
+
+def load_time():
+    ds = xr.open_dataset(HR_FILES[3])
+    time_name = next((c for c in ["time", "TIME", "date"]
+                      if c in ds.coords or c in ds.dims), None)
+    if time_name is None:
+        raise RuntimeError("No time coordinate found in dataset")
+    time = ds[time_name].values
+    ds.close()
+    return time
+
+
+def idx_to_date(idx, time_array):
+    return str(pd.to_datetime(time_array[idx]).date())
+
+
+def make_latlon(shape, lat, lon):
+    H, W   = shape
+    lat_hr = np.linspace(float(lat.min()), float(lat.max()), H)
+    lon_hr = np.linspace(float(lon.min()), float(lon.max()), W)
+    if lat[0] > lat[-1]:
+        lat_hr = lat_hr[::-1]
+    return lat_hr, lon_hr
+
+
+# =============================================================================
+# INTENSITY METRICS  (unchanged)
+# =============================================================================
+
+def intensity_error(pred_mm, gt_mm, wet_thresh_mm):
+    wet = gt_mm > wet_thresh_mm
+    if wet.sum() == 0:
+        return float("nan")
+    gt_max   = float(np.max(gt_mm[wet]))
+    pred_max = float(np.max(pred_mm[wet]))
+    return 100.0 * abs(pred_max - gt_max) / (gt_max + 1e-6)
+
+
+# =============================================================================
+# ANALYTICS  (unchanged)
+# =============================================================================
+
+def compute_psd_2d(field):
+    field = np.asarray(field)
+    if field.ndim == 3:
+        field = field[0]
+    f   = field - np.mean(field)
+    fft = np.fft.fft2(f)
+    return np.fft.fftshift((np.abs(fft) ** 2) / f.size)
+
+
+def radial_average(psd2d):
+    h, w = psd2d.shape
+    cy, cx = h // 2, w // 2
+    y, x   = np.indices((h, w))
+    r      = np.sqrt((x - cx)**2 + (y - cy)**2).astype(int)
+    tbin   = np.bincount(r.ravel(), psd2d.ravel())
+    nr     = np.bincount(r.ravel())
+    return (tbin / (nr + 1e-8))[1:min(h, w)//2]
+
+
+def compute_mean_psd(fields):
+    psds    = [radial_average(compute_psd_2d(f)) for f in fields]
+    min_len = min(len(p) for p in psds)
+    return np.array([p[:min_len] for p in psds]).mean(axis=0)
+
+
+def compute_pcc(a, b):
+    a = np.asarray(a).flatten()
+    b = np.asarray(b).flatten()
+    if a.std() < 1e-8 or b.std() < 1e-8:
+        return 0.0
+    return float((pearsonr(a, b)[0] + 1.0) / 2.0)
+
+
+def compute_pcc_sg(a, b, lat, lon, extent):
+    a_sg, lat_sg, lon_sg = clip_field(a, lat, lon, extent)
+    b_sg, _, _           = clip_field(b, lat, lon, extent)
+    if a_sg.size == 0 or b_sg.size == 0:
+        return 0.0
+    af, bf = a_sg.flatten(), b_sg.flatten()
+    if af.std() < 1e-8 or bf.std() < 1e-8:
+        return 0.0
+    return float((pearsonr(af, bf)[0] + 1.0) / 2.0)
+
+
+# manual_pdf removed � KDE is used exclusively for PCC figures [C2]
+
+
+# =============================================================================
+# STYLE
+# =============================================================================
+
+def apply_style():
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.facecolor":   "white",
+        "axes.edgecolor":   "black",
+        "axes.labelcolor":  "black",
+        "xtick.color":      "black",
+        "ytick.color":      "black",
+        "text.color":       "black",
+        "grid.color":       "gray",
+        "grid.linewidth":   0.5,
+        "legend.frameon":   False,
+        "font.family":      "serif",
+        "font.size":        25,
+        "axes.titlesize":   12,
+        "axes.labelsize":   11,
+    })
+
+
+def _shp(ax, shp):
+    if shp is not None:
+        shp.boundary.plot(ax=ax, color="#000000",
+                          linewidth=2.0, alpha=1.0, zorder=6)
+                          
+                          
+                          
+def _plot_country_borders(ax, world_gdf, color="#333333", linewidth=1.1, alpha=0.85, zorder=5):
+    """Plot borders of all countries in the region"""
+    if world_gdf is None:
+        return
+    world_gdf.boundary.plot(ax=ax, color=color, linewidth=linewidth, 
+                           alpha=alpha, zorder=zorder)
+
+
+def _pixel_grid(ax, field_shape, extent, color="gray"):
+    H, W = field_shape
+    lon_min, lon_max, lat_min, lat_max = extent
+    dx = (lon_max - lon_min) / W
+    dy = (lat_max - lat_min) / H
+    kw = dict(color=color, linewidth=0.4, alpha=0.35, zorder=5)
+    for i in range(W + 1):
+        ax.axvline(lon_min + i * dx, **kw)
+    for j in range(H + 1):
+        ax.axhline(lat_min + j * dy, **kw)
+
+
+def _discrete_cb(fig, ax, im, cmap, norm, bounds, label):
+    cb = fig.colorbar(im, ax=ax, cmap=cmap, norm=norm,
+                      fraction=0.038, pad=0.02,
+                      ticks=bounds, spacing="uniform")
+    cb.set_label(label, color=TEXT, fontsize=20)
+    tick_labels = [f"{b:.0f}" if b == int(b) else f"{b:.1f}" for b in bounds]
+    cb.ax.set_yticklabels(tick_labels, color=SUB, fontsize=18)
+    cb.outline.set_edgecolor(GRID)
+    return cb
+
+
+def _save(fig, path):
+    fig.savefig(path, dpi=220, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Saved -> {path}")
+
+# =============================================================================
+# STYLE - Updated for clean white look
+# =============================================================================
+def apply_style():
+    plt.rcParams.update({
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "axes.edgecolor": "black",
+        "axes.labelcolor": "black",
+        "xtick.color": "black",
+        "ytick.color": "black",
+        "text.color": "black",
+        "grid.color": "gray",
+        "grid.linewidth": 0.5,
+        "legend.frameon": False,
+        "font.family": "serif",
+        "font.size": 24,
+        "axes.titlesize": 22,
+        "axes.labelsize": 20,
+    })
+
+# =============================================================================
+# FIGURE BUILDERS - Clean version with shapefiles (no special bold Singapore)
+# =============================================================================
+
+def build_map_fig(gt, s2, extent, shp, world_gdf=None, title_tag="",
+                  int_err_s2=None, grid_spacing=0.072, wet_thresh_mm=0.1):
+    """
+    Full domain map - Shows shapefiles normally (Singapore + countries)
+    """
+    err = s2 - gt
+    rain_vmax = float(np.nanpercentile(np.concatenate([gt.ravel(), s2.ravel()]), 99))
+    rain_vmax = max(rain_vmax, 0.1)
+    
+    err_flat = err.ravel()[np.isfinite(err.ravel())]
+    pos_lim = float(np.nanpercentile(err_flat, 99))
+    neg_lim = float(np.nanpercentile(err_flat, 1))
+    err_lim = max(abs(pos_lim), abs(neg_lim), 0.05)
+
+    cmap_r, norm_r, bounds_r = make_dynamic_cmap(rain_vmax, n_levels=9, kind="rain")
+    cmap_e, norm_e, bounds_e = make_dynamic_cmap(err_lim, n_levels=9, kind="error")
+
+    data = [gt, s2, err]
+    cmaps = [cmap_r, cmap_r, cmap_e]
+    norms = [norm_r, norm_r, norm_e]
+    ttls = ["Ground Truth", "Model", "Error (Pred - GT)"]
+
+    fig = plt.figure(figsize=(18, 5.8), facecolor="white")
+    gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.08,
+                           left=0.02, right=0.97, top=0.87, bottom=0.04)
+
+    ims, axes = [], []
+    for k in range(3):
+        ax = fig.add_subplot(gs[k])
+        im = ax.imshow(data[k], origin="lower", extent=extent,
+                       cmap=cmaps[k], norm=norms[k], interpolation="bilinear")
+
+        # World country borders (normal)
+        if world_gdf is not None:
+            world_gdf.boundary.plot(ax=ax, color="#000000", linewidth=1.5, 
+                                   alpha=0.85, zorder=6)
+        
+        
+
+        _pixel_grid(ax, data[k].shape, extent, color="gray")
+
+        ax.set_title(ttls[k], color="black", fontsize=22, weight="bold", pad=8)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+
+        for sp in ax.spines.values():
+            sp.set_edgecolor("black")
+
+        ims.append(im)
+        axes.append(ax)
+
+    # Stats box
+    wet_mask = gt > wet_thresh_mm
+    pcc = compute_pcc(s2, gt)
+    bias = float(np.nanmean(err[wet_mask])) if wet_mask.any() else 0.0
+    rmse = float(np.sqrt(np.nanmean((err[wet_mask])**2))) if wet_mask.any() else 0.0
+
+    lines = [f"PCC {pcc:.3f}", f"Bias {bias:+.2f} mm", f"RMSE {rmse:.2f} mm"]
+    if int_err_s2 is not None:
+        lines.append(f"IntErr {int_err_s2:.2f}%")
+
+    axes[1].text(0.02, 0.03, "\n".join(lines),
+                 transform=axes[1].transAxes, fontsize=19, color="black",
+                 bbox=dict(fc="white", ec="gray", alpha=0.85, pad=4), va="bottom")
+
+    # Colorbars
+    cb1 = fig.colorbar(ims[0], ax=axes[:2], cmap=cmap_r, norm=norm_r,
+                       fraction=0.018, pad=0.01, ticks=bounds_r, shrink=0.90)
+    cb1.set_label("Precipitation (mm/day)", color="black", fontsize=22)
+    cb1.ax.set_yticklabels([f"{b:.1f}" for b in bounds_r], color="black", fontsize=19)
+
+    _discrete_cb(fig, axes[2], ims[2], cmap_e, norm_e, bounds_e, "Signed Error (mm)")
+
+    fig.suptitle(f"Singapore Full Domain {title_tag}", 
+                 color="black", fontsize=24, weight="bold", y=0.96)
+
+    return fig
+
+
+def build_sg_map_fig(gt, pred, extent, shp, world_gdf=None, title_tag=""):
+    """
+    Singapore-focused map - Shows shapefiles normally (Singapore + countries)
+    """
+    err = pred - gt
+    rain_vmax = float(np.nanpercentile(np.concatenate([gt.ravel(), pred.ravel()]), 99))
+    rain_vmax = max(rain_vmax, 1.0)
+
+    err_flat = err.ravel()[np.isfinite(err.ravel())]
+    pos_lim = float(np.nanpercentile(err_flat, 99))
+    neg_lim = float(np.nanpercentile(err_flat, 1))
+    err_lim = max(abs(pos_lim), abs(neg_lim), 0.05)
+
+    cmap_r, norm_r, bounds_r = make_dynamic_cmap(rain_vmax, kind="rain")
+    cmap_e, norm_e, bounds_e = make_dynamic_cmap(err_lim, kind="error")
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), facecolor="white")
+    fig.patch.set_facecolor("white")
+
+    titles = ["Ground Truth", "Model", "Error (Pred - GT)"]
+    data = [gt, pred, err]
+    cmaps = [cmap_r, cmap_r, cmap_e]
+    norms = [norm_r, norm_r, norm_e]
+
+    for i, ax in enumerate(axes):
+        ax.set_facecolor("white")
+        im = ax.imshow(data[i], origin="lower", extent=extent,
+                       cmap=cmaps[i], norm=norms[i], interpolation="bilinear")
+
+        # World country borders (normal)
+        if world_gdf is not None:
+            world_gdf.boundary.plot(ax=ax, color="#000000", linewidth=1.5, 
+                                   alpha=0.85, zorder=6)
+        
+        
+
+        ax.set_title(titles[i], color="black", fontsize=22, weight="bold", pad=6)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Stats box
+    wet_mask = gt > 0.1
+    bias = float(np.nanmean(err[wet_mask])) if wet_mask.any() else 0.0
+    rmse = float(np.sqrt(np.nanmean(err[wet_mask]**2))) if wet_mask.any() else 0.0
+    pcc = compute_pcc(pred, gt)
+
+    axes[2].text(0.02, 0.03,
+                 f"Bias {bias:+.2f} mm\nRMSE {rmse:.2f} mm\nPCC {pcc:.3f}",
+                 transform=axes[2].transAxes, fontsize=19, color="black",
+                 bbox=dict(fc="white", ec="gray", alpha=0.85, pad=4), va="bottom")
+
+    fig.suptitle(title_tag + " Singapore Region", fontsize=24, color="black", weight="bold")
+    fig.tight_layout()
+
+    return fig
+
+
+# [C1] PSD: gt vs coarse LR upsampled input vs CorrDiff output
+def build_psd_figure(gt_list, lr_list, s2_list):
+    """
+    Spatial PSD: Ground Truth (8 km) vs Coarse Input (32 km bilinear upsampled)
+    vs CorrDiff output.
+
+    Parameters
+    ----------
+    gt_list  : list of 2-D GT precipitation arrays
+    lr_list  : list of 2-D coarse LR upsampled precipitation arrays  [C1]
+    s2_list  : list of 2-D CorrDiff-predicted precipitation arrays
+    """
+    psd_gt = compute_mean_psd(gt_list)
+    psd_lr = compute_mean_psd(lr_list)   # true coarse input [C1]
+    psd_s2 = compute_mean_psd(s2_list)
+
+    psd_gt /= psd_gt.sum() + 1e-8
+    psd_lr /= psd_lr.sum() + 1e-8
+    psd_s2 /= psd_s2.sum() + 1e-8
+
+    freq = np.arange(1, len(psd_gt) + 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(freq, psd_gt, linewidth=2.5, label="Ground Truth (8 km)")
+    ax.plot(freq, psd_lr, linewidth=2,   linestyle="--",
+            label="Coarse Input (32 km bilinear)")   # [C1]
+    ax.plot(freq, psd_s2, linewidth=2,   label="Model Output")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Spatial Frequency (Radial)")
+    ax.set_ylabel("Normalised Power Spectral Density")
+    ax.set_title("Spatial Power Spectrum  Resolution Recovery")
+    ax.legend(frameon=False)
+    ax.grid(alpha=0.2)
+    return fig
+
+
+# [C2] PCC figures: pure gaussian_kde � no histogram fallback
+def _build_pcc_fig(pcc_values, title, xlabel, pcc_floor=0.6):
+    """
+    KDE-based PDF of PCC values (values below pcc_floor are filtered out).
+
+    Parameters
+    ----------
+    pcc_values : array-like of PCC scores in [0, 1]
+    title      : axes title string
+    xlabel     : x-axis label string
+    pcc_floor  : filter threshold (default 0.6)
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    arr = np.asarray(pcc_values, dtype=float)
+    arr = arr[np.isfinite(arr) & (arr >= pcc_floor)]
+
+    if len(arr) < 2:
+        ax.text(0.5, 0.5, "Insufficient data after filtering",
+                ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return fig
+
+    x   = np.linspace(pcc_floor, 1.0, 400)
+    kde = gaussian_kde(arr)          # [C2] KDE only
+    ax.plot(x, kde(x), linewidth=2, label="Model")
+    ax.fill_between(x, kde(x), alpha=0.15)
+
+    median = float(np.median(arr))
+    ax.axvline(median, linestyle=":", linewidth=2,
+               label=f"Median = {median:.3f}")
+
+    ax.set_xlim(pcc_floor, 1.0)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Probability Density")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    return fig
+
+
+def build_pcc_figure(pcc_s2):
+    """PCC distribution over full domain."""
+    return _build_pcc_fig(
+        pcc_s2,
+        title="PCC compared with GT (full domain)",
+        xlabel=f"PCC (= 0.6)",
+    )
+
+
+def build_pcc_sg_figure(pcc_s2_sg):
+    """PCC distribution over Singapore region."""
+    return _build_pcc_fig(
+        pcc_s2_sg,
+        title="PCC compared with GT (Singapore region)",
+        xlabel=f"PCC (Singapore region, = 0.6)",
+    )
+
+
+# =============================================================================
+# [C4] MAIN  -- regressor / s1 paths removed; lr_up_mm for PSD; SG map focus
+# =============================================================================
+def main():
+    apply_style()
+    time_array = load_time()
+
+    print("Loading dataset...")
+    dataset = ClimateDataset(LR_FILES, HR_FILES, rank=0)
+
+    global PRECIP_MEAN, PRECIP_STD
+    PRECIP_MEAN = dataset.mean["precip"]
+    PRECIP_STD  = dataset.std["precip"]
+    print(f" PRECIP_MEAN (log-space) = {PRECIP_MEAN:.4f}")
+    print(f" PRECIP_STD  (log-space) = {PRECIP_STD:.4f}")
+
+    # -- Data split ------------------------------------------------------------
+    n   = len(dataset)
+    gen = torch.Generator().manual_seed(42)
+    _, _, test_set = random_split(
+        dataset,
+        [int(0.65*n), int(0.15*n), n - int(0.65*n) - int(0.15*n)],
+        generator=gen,
+    )
+    test_indices     = test_set.indices
+    test_indices_set = set(test_indices)   # O(1) membership
+
+    test_loader = DataLoader(test_set, batch_size=4, shuffle=False, num_workers=2)
+    print(f" Test samples: {len(test_set)}")
+
+    # -- Geo -------------------------------------------------------------------
+    print("Loading geo...")
+    #lat, lon, full_ext, clip_ext, shp = load_geo()
+    lat, lon, full_ext, clip_ext, shp, world_gdf = load_geo()
+
+    lat_hr_full, lon_hr_full = make_latlon((256, 276), lat, lon)
+    sg_mask_full             = create_sg_mask(lat_hr_full, lon_hr_full, shp)
+
+    WET_THRESH_MM = 0.01
+    print(f" WET_THRESH_MM = {WET_THRESH_MM:.4f} mm")
+
+    # -- Model -----------------------------------------------------------------
+    print("Loading model...")
+    model, embedding_fw = load_model(DEVICE)
+
+    
+    print("Searching for top rainfall samples over Singapore...")
+    sg_candidates = []
+
+    for i in range(len(test_set)):
+        dataset_idx   = test_indices[i]
+        _, hr_s       = dataset[dataset_idx]
+        rain          = to_mm(hr_s[PRECIP_CH].numpy(), PRECIP_MEAN, PRECIP_STD)
+        rain_sg, _, _ = clip_field(rain, lat_hr_full, lon_hr_full, clip_ext)
+        mask_sg, _, _ = clip_field(sg_mask_full, lat_hr_full, lon_hr_full, clip_ext)
+
+        rain_sg_masked = rain_sg[mask_sg]
+        if rain_sg_masked.size == 0:
+            continue
+        v = float(np.max(rain_sg_masked))
+        if v > WET_THRESH_MM:
+            sg_candidates.append((v, dataset_idx))
+
+    sg_candidates.sort(reverse=True)
+    TOP_N       = 10
+    top_samples = sg_candidates[:TOP_N]
+
+    if len(top_samples) == 0:
+        raise RuntimeError("No valid rainy samples found.")
+
+    # Optional forced sample
+    FORCED_IDX = 6584
+    if FORCED_IDX in test_indices_set and not any(idx == FORCED_IDX for _, idx in top_samples):
+        _, hr_f       = dataset[FORCED_IDX]
+        rain_f        = to_mm(hr_f[PRECIP_CH].numpy(), PRECIP_MEAN, PRECIP_STD)
+        rain_sg, _, _ = clip_field(rain_f, lat_hr_full, lon_hr_full, clip_ext)
+        v = float(np.max(rain_sg)) if rain_sg.size > 0 else 0.0
+        top_samples.append((v, FORCED_IDX))
+        print(f" Force-added {FORCED_IDX}")
+
+    print(f" Top {len(top_samples)} Singapore samples:")
+    for rank, (val, idx) in enumerate(top_samples):
+        print(f" #{rank+1} {idx_to_date(idx, time_array)}  SG_max={val:.2f} mm")
+
+    clip_ext_sg = clip_ext
+
+    # -- Map generation (Singapore focus) -------------------------------------
+    for rank, (best_val, best_idx) in enumerate(top_samples):
+        date_str = idx_to_date(best_idx, time_array)
+        tag      = f"rank{rank+1}_{date_str}"
+        print(f"\n--- #{rank+1} {date_str}  max={best_val:.2f} mm ---")
+
+        lr_s, hr_s = dataset[best_idx]
+        lr_t       = lr_s.unsqueeze(0).to(DEVICE)
+
+        with torch.no_grad():
+            H, W = hr_s.shape[-2], hr_s.shape[-1]
+            s2   = model.sample(lr_t, n_steps=N_INFER, embedding_fw=embedding_fw)
+
+        gt_mm = to_mm(hr_s[PRECIP_CH].numpy(),        PRECIP_MEAN, PRECIP_STD)
+        s2_mm = to_mm(s2[0, PRECIP_CH].cpu().numpy(), PRECIP_MEAN, PRECIP_STD)
+
+        lat_hr, lon_hr = make_latlon(gt_mm.shape, lat, lon)
+        if lat_hr[0] > lat_hr[-1]:
+            gt_mm  = np.flipud(gt_mm)
+            s2_mm  = np.flipud(s2_mm)
+            lat_hr = lat_hr[::-1]
+
+        # --- Primary: Singapore-clipped map ---
+        gt_sg, lat_sg, lon_sg = clip_field(gt_mm, lat_hr, lon_hr, clip_ext_sg)
+        s2_sg, _, _           = clip_field(s2_mm, lat_hr, lon_hr, clip_ext_sg)
+
+        f_sg = build_sg_map_fig(
+            gt_sg, s2_sg, clip_ext_sg, shp, world_gdf=world_gdf,   #  added world_gdf
+            title_tag=f"Singapore {date_str} "
+        )
+        _save(f_sg, f"{OUTPUT_DIR}/sg_{tag}.png")
+
+        # --- Full-domain map (secondary) ---
+        
+        f_full = build_map_fig(
+            gt_mm, s2_mm, full_ext, shp, world_gdf,   # <-- ADD world_gdf here
+            f"Full Domain {date_str} ",
+            grid_spacing=1.0,
+            wet_thresh_mm=WET_THRESH_MM,
+        )
+        _save(f_full, f"{OUTPUT_DIR}/full_{tag}.png")
+
+    # -- Full test-set evaluation -----------------------------------------------
+    '''print("\nRunning full test-set evaluation...")
+    pcc_s2_f    = []
+    pcc_s2_sg_f = []
+    int_err_s2_f = []
+    gt_f, lr_up_f, s2_f = [], [], []   # [C1] lr_up_f for PSD
+
+    with torch.no_grad():
+        for lr_b, hr_b in test_loader:
+            lr_b = lr_b.to(DEVICE)
+            hr_b = hr_b.to(DEVICE)
+
+            p_mm  = to_mm(hr_b[:, PRECIP_CH].cpu().numpy(), PRECIP_MEAN, PRECIP_STD)
+            p_max = p_mm.reshape(p_mm.shape[0], -1).max(axis=1)
+            wet   = p_max > WET_THRESH_MM
+            if wet.sum() == 0:
+                continue
+
+            lr_w = lr_b[wet]
+            hr_w = hr_b[wet]
+            H2, W2 = hr_w.shape[-2], hr_w.shape[-1]
+
+            # [C1] coarse LR bilinear upsampled to HR size (no regressor)
+            lr_up = F.interpolate(lr_w, size=(H2, W2),
+                                  mode="bilinear", align_corners=False)
+
+            s2 = model.sample(lr_w, n_steps=N_INFER, embedding_fw=embedding_fw)
+
+            for i in range(hr_w.size(0)):
+                g    = to_mm(hr_w[i,  PRECIP_CH].cpu().numpy(), PRECIP_MEAN, PRECIP_STD)
+                lr_i = to_mm(lr_up[i, PRECIP_CH].cpu().numpy(), PRECIP_MEAN, PRECIP_STD)
+                s2_  = to_mm(s2[i,    PRECIP_CH].cpu().numpy(), PRECIP_MEAN, PRECIP_STD)
+
+                lat_hr, lon_hr = make_latlon(g.shape, lat, lon)
+
+                pcc_s2_f.append(compute_pcc(s2_, g))
+                pcc_s2_sg_f.append(compute_pcc_sg(s2_, g, lat_hr, lon_hr, clip_ext))
+                int_err_s2_f.append(intensity_error(s2_, g, WET_THRESH_MM))
+
+                gt_f.append(g)
+                lr_up_f.append(lr_i)   # [C1]
+                s2_f.append(s2_)
+
+    # -- Metrics ---------------------------------------------------------------
+    ie2_arr = np.array([v for v in int_err_s2_f if not np.isnan(v)])
+    print(f"\n === Results ({len(gt_f)} samples) ===")
+    print(f" PCC  S2 = {np.mean(pcc_s2_f):.4f}")
+    print(f" IntErr S2 = {ie2_arr.mean():.4f}")
+
+    # PSD  [C1]: gt vs coarse LR upsampled vs CorrDiff
+    fig_psd = build_psd_figure(gt_f[:100], lr_up_f[:100], s2_f[:100])
+    _save(fig_psd, f"{OUTPUT_DIR}/Figure_PSD.png")
+
+    # PCC full domain  [C2]
+    fig_pcc = build_pcc_figure(pcc_s2_f)
+    _save(fig_pcc, f"{OUTPUT_DIR}/Figure_PCC.png")
+
+    # PCC SG region  [C2]
+    fig_pcc_sg = build_pcc_sg_figure(pcc_s2_sg_f)
+    _save(fig_pcc_sg, f"{OUTPUT_DIR}/Figure_PCC_SG.png")
+
+    print("\nDone.")'''
+
+
+if __name__ == "__main__":
+    main()
