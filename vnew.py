@@ -44,7 +44,7 @@ SAVE_DIR  = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/SRGAN_pipeline/CorrDiff/
 _RHO        = 5.0
 PRECIP_CH   = 3
 N_CH        = 4
-N_QUANTILES = 500
+N_QUANTILES = 1500
 
 USE_PAPER_EMBEDDING = True
 SNR_CLIP            = 5.0
@@ -53,7 +53,7 @@ SNR_CLIP            = 5.0
 SG_LAT_C  = 1.3
 SG_LON_C  = 103.8
 SG_SIGMA  = 1.2      # degrees, Gaussian half-width
-SG_WEIGHT = 11.0      # peak multiplier at Singapore centre
+SG_WEIGHT = 13.0      # peak multiplier at Singapore centre
 
 
 # =============================================================================
@@ -339,10 +339,10 @@ class SingaporeCorrDiffModel(nn.Module):
         self.rho           = rho
         for p in self.regressor.parameters():
             p.requires_grad_(False)
+        self.regressor_frozen = True
 
     def get_mu(self, lr):
-        with torch.no_grad():
-            return self.regressor(lr)
+        return self.regressor(lr)
 
     def _mu_at_size(self, lr, H, W):
         mu_raw = self.get_mu(lr)
@@ -376,7 +376,7 @@ class SingaporeCorrDiffModel(nn.Module):
         c_skip, c_out, c_in, c_noise = edm_precond(sigma, self.sigma_data)
         F_x           = self.diffusion_net(c_in * net_input, c_noise)
         residual_pred = c_skip * residual_noisy + c_out * F_x
-        residual_pred = torch.clamp(residual_pred, -1.5, 1.5)
+        residual_pred = torch.clamp(residual_pred, -3.0, 3.0)
 
         pred = (mu + residual_pred).clamp(min=0.0)
         return pred, mu, residual_pred, residual_target, c_skip, c_out
@@ -418,7 +418,7 @@ class SingaporeCorrDiffModel(nn.Module):
                 d2  = (xn - Dx2) / sn
                 x   = x + (sn - sc) * (d + d2) * 0.5
 
-        return (mu + x.clamp(-1.4, 1.8)).clamp(min=0.0)
+        return (mu + x.clamp(-2.5, 2.5)).clamp(min=0.0)
 
 
 # =============================================================================
@@ -519,7 +519,7 @@ def loss_spatial_pcc(pred_p, gt_p, weight_map):
     
     # ===== PART B: Singapore-only PCC (pure alignment test) =====
     w_raw = weight_map.squeeze()  # [H, W]
-    sg_mask = (w_raw > 2.0)  # Strong Singapore region threshold [H, W]
+    sg_mask = (w_raw > 1.2)  # Strong Singapore region threshold [H, W]
     n_sg = sg_mask.sum().item()
     
     loss_sg = 0.0
@@ -545,7 +545,7 @@ def loss_spatial_pcc(pred_p, gt_p, weight_map):
         loss_sg = (1.0 - corr_sg).mean()
     
     # Combine: 40% global + 60% Singapore (focus on Singapore)
-    total_pcc_loss = 0.5 * loss_global + 0.5 * loss_sg
+    total_pcc_loss = 0.3 * loss_global + 0.7 * loss_sg
     
     return torch.clamp(total_pcc_loss, min=0.0, max=2.0)
 
@@ -582,19 +582,14 @@ def loss_intensity(pred_p, gt_p, weight_map, wet_thresh, k_frac=0.08, tail_weigh
 
     # Topk by error (current idea, keep)
     topk_idx_err = error_abs.topk(k_global, dim=1).indices
-    loss_err_global = F.mse_loss(pred_flat.gather(1, topk_idx_err),
-                                 gt_flat.gather(1, topk_idx_err))
+    #loss_err_global = F.mse_loss(pred_flat.gather(1, topk_idx_err),
+    #                             gt_flat.gather(1, topk_idx_err))
 
     # NEWiest GT pixels → force model to match peak intensities
     topk_idx_heavy = gt_flat.topk(k_global, dim=1).indices
     loss_heavy_global = F.mse_loss(pred_flat.gather(1, topk_idx_heavy),
                                    gt_flat.gather(1, topk_idx_heavy))
 
-    # Relative penalty on extremes (helps tail without exploding gradients)
-    rel_err = torch.abs((pred_flat - gt_flat) / (gt_flat + 1.0)).gather(1, topk_idx_heavy)
-    loss_rel = rel_err.mean()
-
-    loss_global = loss_err_global + 0.6 * loss_heavy_global + 0.4 * loss_rel
 
     #
     sg_mask = (weight_map > 1.5).float().expand(B, 1, H, W)
@@ -616,7 +611,7 @@ def loss_intensity(pred_p, gt_p, weight_map, wet_thresh, k_frac=0.08, tail_weigh
     else:
         loss_sg = torch.tensor(0.0, device=pred_p.device)
 
-    return loss_global + tail_weight * loss_sg   # keep high SG multiplier (was 4.0)
+    return 0.3 * loss_heavy_global + tail_weight * loss_sg   # keep high SG multiplier (was 4.0)
 
 # MINIMAL FIX FOR NEGATIVE LOSS
 # Replace ONLY the loss_ssim() function in your code
@@ -702,15 +697,18 @@ class AdaptiveLossWeights:
             if k == 'pcc':
                 new_w = max(new_w, 5.0)      # raise floor from 3.0 to 5.0
             elif k == 'intensity':
-                new_w = min(new_w, 7.0)      # add CEILING of 3.0
-                new_w = max(new_w, 3.5)
+                new_w = min(new_w, 3.0)      # add CEILING of 3.0
+                new_w = max(new_w, 1.5)
             elif k == 'ssim':
                 new_w = min(new_w, 0.5)      # keep ssim small   # ADD THIS hard cap on SSIM
+                
+            if k == 'pcc':
+                new_w = max(new_w, 6.0)
             
             self.weights[k] = max(self.min_w, min(self.max_w, new_w))
         
         # Optional: slight boost to EDM for stability
-        self.weights['edm'] = max(self.weights['edm'], 0.4)
+        self.weights['edm'] = max(self.weights['edm'], 0.7)
 
     def get_weights(self):
         return self.weights.copy()
@@ -732,13 +730,13 @@ class GradientBalancedLoss:
                 self.grad_norm_ma[k] = (1 - self.momentum) * loss_dict[k] + \
                                        self.momentum * self.grad_norm_ma[k]
 
-        total = sum(self.grad_norm_ma.values()) + 1e-8
+        total = self.grad_norm_ma['edm'] + self.grad_norm_ma['pcc'] + self.grad_norm_ma['intensity']
         for k in self.weights:
             self.weights[k] = (self.grad_norm_ma[k] / total) * 12.0
 
         # Stability constraints
-        self.weights['pcc'] = max(self.weights['pcc'], 4.0)
-        self.weights['intensity'] = max(self.weights['intensity'], 3.5)
+        self.weights['pcc'] = max(self.weights['pcc'], 6.0)
+        self.weights['intensity'] = min(self.weights['intensity'], 3.5)
         self.weights['tail'] = max(self.weights['tail'], 2.2)
         self.weights['ssim'] = min(self.weights['ssim'], 0.6)
 
@@ -801,12 +799,12 @@ def corrdiff_loss_v5_adaptive(pred_full, y_fine_full, residual_pred, residual_ta
     # ================== TOTAL LOSS (with stronger intensity focus) ==================
     total = (w['edm']     * l_edm +
              w['pcc']     * l_pcc +
-             w['intensity'] * l_int * 1.25 +     # moderate boost for intensity
+             w['intensity'] * l_int * 0.85 +     # moderate boost for intensity
              w['ssim']    * l_ssim +
              1.0 * l_sparsity +
              0.2 * l_mass +
              0.3 * l_hf_psd +
-             2.2 * l_tail)                       # good weight for tail
+             0.5 * l_tail)                       # good weight for tail
 
     if total.item() < 0 or torch.isnan(total) or torch.isinf(total):
         log(f"[W] Unstable loss: {total.item():.4f}, using safe fallback")
@@ -1037,9 +1035,9 @@ def main():
     BATCH_SIZE = 32
     LEARNING_RATE = 2e-5
     EPOCHS = 15000
-    PATIENCE = 400
+    PATIENCE = 1000
     P_STD = 0.8
-    N_STEPS_FAST = 50
+    N_STEPS_FAST = 100
 
     # ------------------------------------------------------------------
     # Dataset
@@ -1056,7 +1054,8 @@ def main():
         if precip_sample.size > N_SAMPLE:
             idx = np.random.choice(precip_sample.size, N_SAMPLE, replace=False)
             precip_sample = precip_sample[idx]
-        WET_THRESH_NORM = float(np.quantile(precip_sample, 0.7))
+        wet_quantile = 0.60   # fixed at start (dynamic later inside loop if needed)
+        WET_THRESH_NORM = float(np.quantile(precip_sample, wet_quantile))
     else:
         WET_THRESH_NORM = 0.0
 
@@ -1172,8 +1171,8 @@ def main():
         dist.all_reduce(has_data, op=dist.ReduceOp.SUM)
     residual_sigma_data = (sig_tensor / has_data.clamp(min=1.0)).item()
 
-    sigma_min = residual_sigma_data * 0.008 
-    sigma_max = residual_sigma_data * 1.5
+    sigma_min = residual_sigma_data * 0.005 
+    sigma_max = residual_sigma_data * 1.6
     P_mean = math.log(residual_sigma_data) + 0.3
 
     model_core.sigma_data = residual_sigma_data
@@ -1196,7 +1195,7 @@ def main():
     optimizer = AdamW(diffusion_net_train.parameters(),
                       lr=LEARNING_RATE, weight_decay=1e-4)
 
-    scheduler = CosineAnnealingLR(optimizer, T_max=500,
+    scheduler = CosineAnnealingLR(optimizer, T_max=1500,
                                   eta_min=LEARNING_RATE * 0.01)
 
     scaler = GradScaler("cuda")
@@ -1215,36 +1214,45 @@ def main():
         ema.shadow = ckpt["ema"]
         optimizer.load_state_dict(ckpt["opt"])
         for pg in optimizer.param_groups:
-            pg['lr'] = 5e-6
+            pg['lr'] = 2e-6
         start_epoch = ckpt["epoch"] + 1
         best_metric = (1.0 - ckpt.get("val_pcc", 0.0)) * 0.5 + \
                       (1.0 - ckpt.get("val_sg_pcc", 0.0)) * 0.5
         log(f"Resumed from epoch {start_epoch}, best composite={best_metric:.4f}")
 
     # ====================== ADAPTIVE WEIGHTS ======================
-    '''adaptive_w = AdaptiveLossWeights(
-        init_weights={'edm': 0.60, 'pcc': 6.0, 'intensity': 5.5, 'ssim': 0.15},  # start higher
-        momentum=0.80
-    )'''
-        # ====================== GRADIENT BALANCED LOSS ======================
-    adaptive_w = GradientBalancedLoss(
-        init_weights={'edm': 1.0, 'pcc': 1.0, 'intensity': 1.2, 'tail': 2.5, 'ssim': 0.3}
+    adaptive_w = AdaptiveLossWeights(
+        init_weights={'edm': 0.65, 'pcc': 6.0, 'intensity': 3.0, 'ssim': 0.2},
+        momentum=0.8
     )
+        # ====================== GRADIENT BALANCED LOSS ======================
+    '''adaptive_w = GradientBalancedLoss(
+        init_weights={'edm': 1.0, 'pcc': 1.0, 'intensity': 1.2, 'tail': 2.5, 'ssim': 0.3}
+    )'''
     # ============================================================
     # Load saved weights ONLY if checkpoint was loaded
     # Load saved weights ONLY if checkpoint was loaded
     if os.path.exists(RESUME_CKPT):
         ckpt_check = torch.load(RESUME_CKPT, map_location='cpu')
         if "adaptive_weights" in ckpt_check:
-            saved_weights = ckpt_check["adaptive_weights"]
-            # Safely merge old checkpoint (which may not have 'tail')
-            for k in adaptive_w.weights:
-                if k in saved_weights:
-                    adaptive_w.weights[k] = saved_weights[k]
+              saved_weights = ckpt_check["adaptive_weights"]
+          
+              # Update weights safely
+              for k in adaptive_w.weights:
+                  if k in saved_weights:
+                      adaptive_w.weights[k] = saved_weights[k]
+          
+              # Update moving averages ONLY if compatible
+              if hasattr(adaptive_w, "loss_ma"):
+                  for k in adaptive_w.loss_ma:
+                      if k in saved_weights:
+                          adaptive_w.loss_ma[k] = saved_weights[k]
             # Also update grad_norm_ma if possible
-            for k in adaptive_w.grad_norm_ma:
-                if k in saved_weights:
-                    adaptive_w.grad_norm_ma[k] = saved_weights[k]
+            #for k in adaptive_w.grad_norm_ma:
+            #    if k in saved_weights:
+            #        adaptive_w.grad_norm_ma[k] = saved_weights[k]
+            # Update loss moving averages if present (new class)
+            
         del ckpt_check
     # ============================================================
     # ============================================================
@@ -1263,6 +1271,31 @@ def main():
     for epoch in range(start_epoch, EPOCHS):
         train_sampler.set_epoch(epoch)
         model_core.diffusion_net.train()
+        # ================= REGRESSOR DELAYED FINETUNE =================
+        if epoch == 1000 and model_core.regressor_frozen:
+        
+            log("Starting VERY LOW LR regressor fine-tuning")
+        
+            regressor_finetune_params = []
+        
+            for name, p in model_core.regressor.named_parameters():
+                if 'decoder' in name or 'final' in name:
+                    p.requires_grad_(True)
+                    regressor_finetune_params.append(p)
+        
+            if len(regressor_finetune_params) > 0:
+                optimizer.add_param_group({
+                    'params': regressor_finetune_params,
+                    'lr': 5e-7
+                })
+        
+            # keep BN/dropout stable
+            for m in model_core.regressor.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+                    
+            model_core.regressor_frozen = False
+        # =============================================================
 
         train_loss = 0.0
         loss_accum = {k: 0.0 for k in LOSS_KEYS}
@@ -1301,7 +1334,20 @@ def main():
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(diffusion_net_train.parameters(), 1.0)
+            # ==== damp regressor gradients (CRITICAL) ====
+            if not model_core.regressor_frozen:
+                for name, p in model_core.regressor.named_parameters():
+                    if p.grad is not None:
+                        p.grad *= 0.1  #  only 5% influence
+            # ============================================
+            
+            params_to_clip = list(diffusion_net_train.parameters())
+            
+            if not model_core.regressor_frozen:
+                params_to_clip += list(model_core.regressor.parameters())
+            
+            torch.nn.utils.clip_grad_norm_(params_to_clip, 1.0)
+            #torch.nn.utils.clip_grad_norm_(diffusion_net_train.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
 
