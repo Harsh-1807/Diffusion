@@ -1,39 +1,93 @@
-# Diffusion
+Dataset Split: train
+Fine resolution: 128x128
+Coarse resolution: 32x32
+Dataset Split: train
+Fine resolution: 128x128
+Coarse resolution: 32x32
+Dataset Split: train
+Fine resolution: 128x128
+Coarse resolution: 32x32
+Dataset Split: train
+Fine resolution: 128x128
+Coarse resolution: 32x32
+Split  Train:12527  Val:1789
 
-Dataset: 7305 Train 4748 Val 1095 Test 1462
+Fitting QDM (1500 quantiles/pixel, linear mm/day)...
+  4000 timesteps | 32x32 grid
+  Coarse: mean=0.641  p95=2.72  max=225.48 mm/day
+  OBS-LR: mean=0.970  p95=5.13  max=278.04 mm/day
+  Q50 shift (obs-coarse): 0.0000 mm/day  (38s)
+  Saved to checkpoints/diffusion/qdm_tables.npz
+
+QDM sanity (mm/day):
+  coarse [0.00, 113.21]  obs-LR [0.00, 129.14]  mapped [0.00, 98.40]
+  Raw MAE=0.4231  QDM MAE=0.2570  Improvement=+0.1661  (better)
+
+Regressor frozen.  sigma_data=0.2098
+
+UNet: 110.86M params
+   Ep |    Ledm |    Lint | wPCC_tr | wPCC_val | s
+----------------------------------------------------
+
+
+
+
+
+
+Loading LR data into RAM...
+Loading HR data into RAM...
+Applying log1p to precipitation BEFORE normalization...
+Computing normalisation stats from HR...
+  huss    : mean=17.4145  std=1.4961
+  mslp    : mean=1009.5259  std=1.5250
+  tas     : mean=27.5557  std=1.6956
+  precip  : mean=0.1499  std=0.3729
+Dataset ready: 7305 samples  LR (64, 69)  HR (256, 276)
+Dataset: 7305 Train 5113 Val 1096 Test 1096
 WET_THRESH_NORM = -0.4018
 Singapore weight map: 256x276 peak=12.99x
   Computing PSD intersection scale s ...
-  s_freq = 0.0547
+  s_freq = 0.0781
  Collecting training data for QDM fitting...
   Fitting GLOBAL + LOCAL QDM...
   QDM fitting complete.
- Embedding ready: s_freq=0.0547
+ Embedding ready: s_freq=0.0781
 Estimating sigma_data ...
- sigma_data=1.4106 sigma_min=0.0071 sigma_max=2.2570
-Resumed from epoch 1581, best composite=0.1991
+ sigma_data=1.4146 sigma_min=0.0071 sigma_max=2.2634
 
 ======================================================================
-CorrDiff Singapore v6-ADAPTIVE -- DO OR DIE
-Adaptive loss weights enabled - automatically balances PCC, Intensity & EDM
-SG weight map peak = 13.0x
+CorrDiff Singapore v7b — SURGICAL MINIMAL FIX
+  Fix A: SSIM C1/C2 now fixed constants (was data-range → saturated)
+  Fix B: intensity += pinball@0.95,0.99 (nudge, not replace)
+  Fix C: adaptive weight update unified bounds (no duplicate floor)
+  Fix D: 'tail' key always in metrics dict
+  LR: 1e-6 (conservative for epoch ~1580 fine-tuning)
+  Scheduler: CosineAnnealing T_max=2000 (no warm-restart spike)
+  Peak SG weight = 13.0x
+  Resume epoch = 0
 ======================================================================
 
-Ep  1586 | loss 3.0399 [edm 0.126(1.99) pcc 0.078(6.00) int 0.419(1.60) ssim 0.788(0.50)] | val PCC 0.8256 SG-PCC 0.7422 I-MAE 0.9323 | composite 0.2078 | 201.4s
-Ep  1591 | loss 3.3283 [edm 0.115(2.62) pcc 0.079(6.00) int 0.393(2.29) ssim 0.786(0.50)] | val PCC 0.8264 SG-PCC 0.7452 I-MAE 0.9443 | composite 0.2061 | 200.1s
-Ep  1596 | loss 3.4269 [edm 0.111(2.83) pcc 0.075(6.00) int 0.388(2.68) ssim 0.784(0.50)] | val PCC 0.8283 SG-PCC 0.7447 I-MAE 0.9355 | composite 0.2051 | 198.3s
-Ep  1601 | loss 3.5361 [edm 0.111(2.78) pcc 0.074(6.00) int 0.380(2.70) ssim 0.785(0.50)] | val PCC 0.8288 SG-PCC 0.7476 I-MAE 0.9391 | composite 0.2037 | 197.3s
-Ep  1606 | loss 3.5268 [edm 0.114(2.68) pcc 0.072(6.00) int 0.388(2.64) ssim 0.785(0.50)] | val PCC 0.8294 SG-PCC 0.7463 I-MAE 0.9295 | composite 0.2038 | 192.3s
-Ep  1611 | loss 3.5170 [edm 0.114(2.58) pcc 0.073(6.00) int 0.384(2.56) ssim 0.786(0.50)] | val PCC 0.8294 SG-PCC 0.7442 I-MAE 0.9308 | composite 0.2047 | 190.8s
-Ep  1616 | loss 3.2986 [edm 0.111(2.52) pcc 0.072(6.00) int 0.379(2.52) ssim 0.783(0.50)] | val PCC 0.8291 SG-PCC 0.7433 I-MAE 0.9344 | composite 0.2052 | 196.8s
-Ep  1621 | loss 3.3029 [edm 0.108(2.49) pcc 0.073(6.00) int 0.363(2.48) ssim 0.786(0.50)] | val PCC 0.8289 SG-PCC 0.7454 I-MAE 0.9309 | composite 0.2045 | 194.8s
-Ep  1626 | loss 3.3140 [edm 0.113(2.53) pcc 0.071(6.00) int 0.377(2.52) ssim 0.785(0.50)] | val PCC 0.8287 SG-PCC 0.7463 I-MAE 0.9325 | composite 0.2043 | 191.3s
-Ep  1631 | loss 3.3029 [edm 0.110(2.48) pcc 0.074(6.00) int 0.368(2.48) ssim 0.788(0.50)] | val PCC 0.8284 SG-PCC 0.7450 I-MAE 0.9297 | composite 0.2050 | 193.7s
-Ep  1636 | loss 3.3490 [edm 0.112(2.52) pcc 0.073(6.00) int 0.370(2.49) ssim 0.786(0.50)] | val PCC 0.8280 SG-PCC 0.7440 I-MAE 0.9300 | composite 0.2056 | 192.3s
-Ep  1641 | loss 3.3202 [edm 0.110(2.50) pcc 0.071(6.00) int 0.365(2.50) ssim 0.786(0.50)] | val PCC 0.8275 SG-PCC 0.7453 I-MAE 0.9298 | composite 0.2054 | 193.5s
-Ep  1646 | loss 3.3117 [edm 0.111(2.51) pcc 0.070(6.00) int 0.364(2.50) ssim 0.788(0.50)] | val PCC 0.8272 SG-PCC 0.7466 I-MAE 0.9318 | composite 0.2051 | 194.2s
-Ep  1651 | loss 3.3314 [edm 0.111(2.49) pcc 0.073(6.00) int 0.369(2.50) ssim 0.786(0.50)] | val PCC 0.8268 SG-PCC 0.7445 I-MAE 0.9448 | composite 0.2061 | 194.7s
-Ep  1656 | loss 3.2622 [edm 0.110(2.50) pcc 0.069(6.00) int 0.366(2.51) ssim 0.787(0.50)] | val PCC 0.8267 SG-PCC 0.7461 I-MAE 0.9262 | composite 0.2055 | 194.9s
-Ep  1661 | loss 3.3721 [edm 0.112(2.52) pcc 0.069(6.00) int 0.371(2.52) ssim 0.786(0.50)] | val PCC 0.8261 SG-PCC 0.7444 I-MAE 0.9345 | composite 0.2066 | 192.8s
-Ep  1666 | loss 3.3191 [edm 0.109(2.49) pcc 0.070(6.00) int 0.361(2.50) ssim 0.786(0.50)] | val PCC 0.8257 SG-PCC 0.7448 I-MAE 0.9364 | composite 0.2066 | 190.5s
-Ep  1671 | loss 3.3768 [edm 0.109(2.51) pcc 0.070(6.00) int 0.352(2.47) ssim 0.786(0.50)] | val PCC 0.8255 SG-PCC 0.7434 I-MAE 0.9321 | composite 0.2073 | 192.6s
+Ep     1 | lr 1.00e-06 | loss 9.7005 [edm 0.556(1.68) pcc 0.268(7.00) int 1.193(3.00) ssim 0.459(0.32) tail 0.114] | val PCC 0.6753 SG-PCC 0.5131 I-MAE 2.3327 | composite 0.4159 | 108.9s
+ >> NEW BEST composite=0.4159 (PCC=0.6753 SG-PCC=0.5131 I-MAE=2.3327)
+Ep     2 | lr 1.00e-06 | loss 10.7875 [edm 0.545(2.00) pcc 0.256(7.00) int 1.233(3.00) ssim 0.458(0.38) tail 0.114] | val PCC 0.6814 SG-PCC 0.5165 I-MAE 2.2738 | composite 0.4089 | 107.7s
+ >> NEW BEST composite=0.4089 (PCC=0.6814 SG-PCC=0.5165 I-MAE=2.2738)
+Ep     3 | lr 1.00e-06 | loss 10.7834 [edm 0.546(2.00) pcc 0.257(7.00) int 1.193(3.00) ssim 0.458(0.42) tail 0.126] | val PCC 0.6900 SG-PCC 0.5242 I-MAE 2.2735 | composite 0.4032 | 108.6s
+ >> NEW BEST composite=0.4032 (PCC=0.6900 SG-PCC=0.5242 I-MAE=2.2735)
+Ep     4 | lr 1.00e-06 | loss 10.0900 [edm 0.559(2.00) pcc 0.246(7.00) int 1.197(3.00) ssim 0.457(0.44) tail 0.111] | val PCC 0.7003 SG-PCC 0.5315 I-MAE 2.2658 | composite 0.3964 | 107.9s
+ >> NEW BEST composite=0.3964 (PCC=0.7003 SG-PCC=0.5315 I-MAE=2.2658)
+Ep     5 | lr 1.00e-06 | loss 10.1777 [edm 0.568(2.00) pcc 0.224(7.00) int 1.202(3.00) ssim 0.455(0.46) tail 0.089] | val PCC 0.7113 SG-PCC 0.5392 I-MAE 2.2157 | composite 0.3867 | 107.6s
+ >> NEW BEST composite=0.3867 (PCC=0.7113 SG-PCC=0.5392 I-MAE=2.2157)
+Ep     6 | lr 1.00e-06 | loss 9.6903 [edm 0.577(2.00) pcc 0.224(7.00) int 1.203(3.00) ssim 0.455(0.47) tail 0.094] | val PCC 0.7214 SG-PCC 0.5484 I-MAE 2.2111 | composite 0.3796 | 108.0s
+ >> NEW BEST composite=0.3796 (PCC=0.7214 SG-PCC=0.5484 I-MAE=2.2111)
+Ep     7 | lr 1.00e-06 | loss 9.4673 [edm 0.571(2.00) pcc 0.221(7.00) int 1.153(3.00) ssim 0.456(0.49) tail 0.116] | val PCC 0.7302 SG-PCC 0.5560 I-MAE 2.1129 | composite 0.3679 | 108.2s
+ >> NEW BEST composite=0.3679 (PCC=0.7302 SG-PCC=0.5560 I-MAE=2.1129)
+Ep     8 | lr 1.00e-06 | loss 9.9611 [edm 0.574(2.00) pcc 0.221(7.00) int 1.171(3.00) ssim 0.455(0.49) tail 0.074] | val PCC 0.7369 SG-PCC 0.5636 I-MAE 2.1035 | composite 0.3624 | 108.1s
+ >> NEW BEST composite=0.3624 (PCC=0.7369 SG-PCC=0.5636 I-MAE=2.1035)
+Ep     9 | lr 1.00e-06 | loss 9.0017 [edm 0.568(2.00) pcc 0.215(7.00) int 1.112(3.00) ssim 0.455(0.50) tail 0.071] | val PCC 0.7427 SG-PCC 0.5718 I-MAE 2.0853 | composite 0.3565 | 107.7s
+ >> NEW BEST composite=0.3565 (PCC=0.7427 SG-PCC=0.5718 I-MAE=2.0853)
+Ep    10 | lr 1.00e-06 | loss 9.5018 [edm 0.556(2.00) pcc 0.218(7.00) int 1.094(3.00) ssim 0.456(0.50) tail 0.083] | val PCC 0.7467 SG-PCC 0.5760 I-MAE 2.0545 | composite 0.3518 | 107.8s
+ >> NEW BEST composite=0.3518 (PCC=0.7467 SG-PCC=0.5760 I-MAE=2.0545)
+Ep    11 | lr 1.00e-06 | loss 9.7225 [edm 0.549(2.00) pcc 0.213(7.00) int 1.093(3.00) ssim 0.454(0.50) tail 0.095] | val PCC 0.7502 SG-PCC 0.5791 I-MAE 1.9841 | composite 0.3453 | 108.3s
+ >> NEW BEST composite=0.3453 (PCC=0.7502 SG-PCC=0.5791 I-MAE=1.9841)
+Ep    16 | lr 1.00e-06 | loss 9.0554 [edm 0.506(2.00) pcc 0.199(7.00) int 1.056(3.00) ssim 0.454(0.50) tail 0.086] | val PCC 0.7601 SG-PCC 0.5943 I-MAE 1.9210 | composite 0.3329 | 107.7s
+ >> NEW BEST composite=0.3329 (PCC=0.7601 SG-PCC=0.5943 I-MAE=1.9210)
