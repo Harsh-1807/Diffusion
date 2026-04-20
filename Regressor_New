@@ -1,0 +1,585 @@
+# -*- coding: utf-8 -*-
+"""
+TrainRegressor.py  — Stage 1 with Temporal Context + Regime-Aware Training
+===========================================================================
+
+FIXES vs previous version (nan at epoch 20):
+  [F1] pred_log clamp unified to (-5, 9) everywhere — no gradient cliff at 5
+  [F2] wpcc() wrapped with nan-guard; loss never takes wpcc term if batch has
+       no wet pixels (returns 0.0 safely)
+  [F3] Loss schedule is now smooth / gradual — no hard jump at epoch 20.
+       Uses a sigmoid ramp so the wPCC term enters slowly over ~200 epochs.
+  [F4] sigma_data (residual std of fine - pred) saved to checkpoint so
+       Stage-2 doesn't need to recompute it from scratch
+  [F5] autocast scope tightened — only forward + loss; backward stays fp32
+  [F6] GradScaler skip detection: if scaler detects inf/nan it skips the
+       step; counter tracked so you can see how often it happens
+  [F7] Dry-gate disabled by default in model kwargs (already was, kept)
+  [F8] Removed dead code (target_delta / pred_delta computed but unused)
+  [F9] All loss terms nan-guarded with .item() check before accumulation
+"""
+
+import os
+import json
+import math
+import time
+import traceback
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+from Dataset import UpscaleDataset
+from NewNetwork import TemporalCorrDiffRegressor, CorrDiffRegressor
+
+# ================================================================
+# CONFIG
+# ================================================================
+RF_PATH     = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/RF_1975to2023.nc"
+ORO_PATH    = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/oro.nc"
+SAVE_PATH   = "checkpoints/regressor/regressor_new.pth"
+LATEST_PATH = "checkpoints/regressor/regressor_latest_new.pth"
+CKPT_DIR    = "checkpoints/regressor/"
+MANIFEST    = "checkpoints/regressor/ensemble_manifest.json"
+
+BATCH_SIZE     = 32
+LR             = 1e-5
+EPOCHS         = 8000
+PRECIP_CH      = 0
+LOG_EVERY      = 5
+USE_TEMPORAL   = False    # set True to use TemporalCorrDiffRegressor
+SEQ_LEN        = 5
+LSTM_LAYERS    = 2
+MAX_CKPTS_KEEP = 16
+
+# Thresholds
+WET_THRESH_LIN = 0.1      # mm/day
+HEAVY_PCTILE   = 90       # percentile for "heavy" pixels
+DRY_MARGIN     = 0.02     # mm/day ghost-rain threshold
+
+# [F3] Loss ramp: wPCC term weight rises from 0 → WPCC_MAX over WPCC_RAMP epochs
+# using a sigmoid schedule.  MSE weight falls correspondingly.
+# This avoids the hard jump that caused nan at epoch 20.
+WPCC_MAX  = 0.8           # max weight for (1 - wPCC) term
+WPCC_RAMP = 300           # epochs to reach ~90% of WPCC_MAX
+MSE_MIN   = 0.05          # floor for MSE weight (never goes below this)
+
+# How often to save ensemble checkpoint
+CKPT_SAVE_EVERY = 50
+
+# ================================================================
+# DDP
+# ================================================================
+def setup_ddp():
+    rank = int(os.environ.get("RANK", 0))
+    ws   = int(os.environ.get("WORLD_SIZE", 1))
+    lr_  = int(os.environ.get("LOCAL_RANK", 0))
+    if ws > 1:
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(lr_)
+    dev = torch.device(f"cuda:{lr_}" if torch.cuda.is_available() else "cpu")
+    return rank, ws, lr_, dev
+
+def is_main(r): return r == 0
+
+def allreduce_mean(t, ws):
+    if ws > 1 and dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM); t /= ws
+    return t
+
+
+# ================================================================
+# [F3] SMOOTH LOSS SCHEDULE
+# ================================================================
+
+def loss_weights(ep: int):
+    """
+    Returns (w_mse, w_wpcc) that sum to 1.0, with w_wpcc rising smoothly
+    via a sigmoid ramp centred at WPCC_RAMP / 2 epochs.
+
+    epoch 0   : w_mse ≈ 1.0,  w_wpcc ≈ 0.0
+    epoch 150 : w_mse ≈ 0.5,  w_wpcc ≈ 0.5 * WPCC_MAX  (mid-ramp)
+    epoch 300+: w_mse ≈ MSE_MIN, w_wpcc ≈ WPCC_MAX
+    """
+    # Sigmoid centred at WPCC_RAMP/2, scaled so it reaches ~0.99 at WPCC_RAMP
+    k = 10.0 / WPCC_RAMP   # steepness
+    sigmoid = 1.0 / (1.0 + math.exp(-k * (ep - WPCC_RAMP / 2)))
+    w_wpcc  = WPCC_MAX * sigmoid
+    w_mse   = max(MSE_MIN, 1.0 - w_wpcc)
+    return w_mse, w_wpcc
+
+
+# ================================================================
+# LOSS FUNCTIONS
+# ================================================================
+
+def mse_log1p(pred_log, target_log):
+    return F.mse_loss(pred_log, target_log)
+
+
+def wet_pixel_l1(pred_lin, target_lin):
+    wet = target_lin > WET_THRESH_LIN
+    if not wet.any():
+        return pred_lin.new_tensor(0.0)
+    return F.l1_loss(pred_lin[wet], target_lin[wet])
+
+
+def heavy_rain_focal_mse(pred_lin, target_lin):
+    wet_vals = target_lin[target_lin > WET_THRESH_LIN]
+    if wet_vals.numel() < 10:
+        return pred_lin.new_tensor(0.0)
+    threshold = torch.quantile(wet_vals, HEAVY_PCTILE / 100.0)
+    heavy = target_lin > threshold
+    if not heavy.any():
+        return pred_lin.new_tensor(0.0)
+    return F.mse_loss(pred_lin[heavy], target_lin[heavy])
+
+
+def dry_pixel_penalty(pred_lin, target_lin):
+    dry = target_lin < WET_THRESH_LIN
+    if not dry.any():
+        return pred_lin.new_tensor(0.0)
+    violation = (pred_lin[dry] - DRY_MARGIN).clamp(min=0.0)
+    return (violation ** 2).mean() * 10.0
+
+
+# ================================================================
+# METRICS
+# ================================================================
+
+def batch_pcc(pred, target):
+    p  = pred.flatten(1); t = target.flatten(1)
+    vp = p - p.mean(1, keepdim=True)
+    vt = t - t.mean(1, keepdim=True)
+    num = (vp * vt).sum(1)
+    den = (vp.pow(2).sum(1).sqrt() * vt.pow(2).sum(1).sqrt()).clamp(min=1e-8)
+    return (num / den).clamp(-1, 1).mean()
+
+
+def wpcc(pred_lin, target_lin):
+    """
+    [F2] Returns 0.0 (not nan) if there are no wet pixels in the batch.
+    Safe to use in a loss term without nan-guarding at the call site.
+    """
+    wet = target_lin.flatten(1).max(1).values > WET_THRESH_LIN
+    if not wet.any():
+        return pred_lin.new_tensor(0.0)
+    p = pred_lin[wet]; t = target_lin[wet]
+    pcc = batch_pcc(p, t)
+    # Extra nan guard — should never trigger but costs nothing
+    if torch.isnan(pcc):
+        return pred_lin.new_tensor(0.0)
+    return pcc
+
+
+def dry_hit_rate(pred_lin, target_lin):
+    dry = target_lin.flatten(1).max(1).values < WET_THRESH_LIN
+    if not dry.any():
+        return pred_lin.new_tensor(1.0)
+    pred_d = pred_lin[dry].flatten(1).max(1).values
+    return (pred_d < DRY_MARGIN).float().mean()
+
+
+def heavy_rmse(pred_lin, target_lin):
+    wet_vals = target_lin[target_lin > WET_THRESH_LIN]
+    if wet_vals.numel() < 10:
+        return pred_lin.new_tensor(0.0)
+    thr   = torch.quantile(wet_vals, 0.90)
+    heavy = target_lin.flatten(1).max(1).values > thr
+    if not heavy.any():
+        return pred_lin.new_tensor(0.0)
+    return F.mse_loss(pred_lin[heavy], target_lin[heavy]).sqrt()
+
+
+# ================================================================
+# EMA
+# ================================================================
+
+class EMA:
+    def __init__(self, model, decay=0.9995, warmup=1000):
+        self.decay  = decay; self.warmup = warmup; self.step = 0
+        self.shadow  = {n: p.data.clone() for n, p in model.named_parameters()
+                        if p.requires_grad}
+        self._backup = None
+
+    def _d(self):
+        return 0.99 + min(self.step / max(self.warmup, 1), 1.0) * (self.decay - 0.99)
+
+    def update(self, model):
+        self.step += 1; d = self._d()
+        with torch.no_grad():
+            for n, p in model.named_parameters():
+                if p.requires_grad:
+                    self.shadow[n].mul_(d).add_(p.data, alpha=1-d)
+
+    def apply(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self.shadow:
+                p.data.copy_(self.shadow[n])
+
+    def backup(self, model):
+        self._backup = {n: p.data.clone() for n, p in model.named_parameters()
+                        if p.requires_grad}
+
+    def restore(self, model):
+        if not self._backup: return
+        for n, p in model.named_parameters():
+            if p.requires_grad and n in self._backup:
+                p.data.copy_(self._backup[n])
+        self._backup = None
+
+
+# ================================================================
+# TEMPORAL SEQUENCE BUILDER
+# ================================================================
+
+def build_seq(ds, indices, seq_len, dev):
+    coarse_all = ds.coarse
+    B = len(indices)
+    C, H, W = coarse_all[0].shape
+    seq = torch.zeros(B, seq_len, C, H, W, device=dev)
+    for b, idx in enumerate(indices):
+        for t in range(seq_len):
+            src_idx = max(0, idx - (seq_len - t))
+            seq[b, t] = coarse_all[src_idx].to(dev)
+    return seq
+
+
+# ================================================================
+# [F4] SIGMA_DATA MEASUREMENT
+# ================================================================
+
+@torch.no_grad()
+def measure_sigma_data(loader, model, dev, n_batches=30):
+    """
+    Compute std of (fine - pred) residuals over n_batches.
+    Saved to checkpoint so Stage-2 picks it up automatically.
+    """
+    model.eval()
+    residuals = []
+    for i, b in enumerate(loader):
+        if i >= n_batches: break
+        fine = b["fine"].to(dev)[:, PRECIP_CH:PRECIP_CH+1]
+        topo = b["topo"].to(dev)
+        tf   = torch.stack([b["doy"], b["hour"]], 1).float().to(dev)
+        xi   = b["coarse"].to(dev)
+        pred = F.softplus(model(xi, topo=topo, global_features=tf), beta=5)
+        residuals.append((fine - pred).flatten().cpu())
+    all_res = torch.cat(residuals)
+    sd = all_res.std().item()
+    return max(sd, 0.01)
+
+
+# ================================================================
+# CHECKPOINT MANIFEST
+# ================================================================
+
+def update_manifest(manifest_path, ckpt_path, wpcc_val, max_keep=MAX_CKPTS_KEEP):
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    else:
+        manifest = {"checkpoints": []}
+
+    manifest["checkpoints"].append({"path": ckpt_path, "wpcc": float(wpcc_val)})
+    manifest["checkpoints"].sort(key=lambda x: x["wpcc"], reverse=True)
+    kept    = manifest["checkpoints"][:max_keep]
+    removed = manifest["checkpoints"][max_keep:]
+
+    for e in removed:
+        p = e["path"]
+        if os.path.exists(p) and p not in (SAVE_PATH, LATEST_PATH):
+            try: os.remove(p)
+            except Exception: pass
+
+    manifest["checkpoints"] = kept
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+# ================================================================
+# TRAINING
+# ================================================================
+
+# ================================================================
+# TRAINING
+def train():
+    rank, ws, lr_, dev = setup_ddp()
+    for p in [RF_PATH, ORO_PATH]:
+        assert os.path.exists(p), f"Missing: {p}"
+
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    ds = UpscaleDataset(RF_PATH, ORO_PATH, split="train", normalize=True, device="cpu")
+
+    n = len(ds)
+    trn = int(0.70 * n)
+    van = int(0.10 * n)
+
+    trl = DataLoader(Subset(ds, range(0, trn)), BATCH_SIZE,
+                     shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+    val = DataLoader(Subset(ds, range(trn, trn+van)), BATCH_SIZE,
+                     shuffle=False, num_workers=4, pin_memory=True)
+
+    if is_main(rank):
+        print(f"[DATA] Train={trn} Val={van}")
+
+    model_kwargs = dict(
+        in_channels=1,
+        out_channels=1,
+        base_channels=96,
+        channel_mult=(1, 2, 4),
+        num_blocks=2,
+        global_dim=2,
+        dropout=0.0,
+        dry_gate=False,
+        cross_attn=True,   # model has cross_attn weights in checkpoint
+        freq_attn=True,
+        drop_path_rate=0.0,
+    )
+
+    if USE_TEMPORAL:
+        model = TemporalCorrDiffRegressor(
+            **model_kwargs,
+            seq_len=SEQ_LEN, lstm_layers=LSTM_LAYERS, fine_size=128,
+        ).to(dev)
+    else:
+        model = CorrDiffRegressor(**model_kwargs).to(dev)
+
+    if ws > 1:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[lr_], find_unused_parameters=True
+        )
+
+    raw_model = model.module if ws > 1 else model
+    ema = EMA(raw_model)
+
+    start_epoch = 0
+    best_wPCC = -1.0
+    sigma_data = None
+
+    # ── Resume from BEST ────────────────────────────────────────────
+    rpath = SAVE_PATH if os.path.exists(SAVE_PATH) else LATEST_PATH
+    if os.path.exists(rpath):
+        if is_main(rank): print(f"[RESUME] {rpath}")
+        ck2 = torch.load(rpath, map_location=dev)
+        try:
+            raw_model.load_state_dict(
+                ck2.get("model_state_dict", ck2.get("ema_state_dict")))
+        except RuntimeError as e:
+            if is_main(rank): print(f" [WARN] state dict mismatch: {e}")
+        if "ema_state_dict" in ck2:
+            ema.shadow = {k: v.clone().to(dev) for k, v in ck2["ema_state_dict"].items()}
+        start_epoch = ck2.get("epoch", 0) + 1
+        best_wPCC = ck2.get("val_wpcc", -1.0)
+        sigma_data = ck2.get("sigma_data", None)
+        if is_main(rank):
+            print(f" epoch={start_epoch} best_wPCC={best_wPCC:.4f}")
+            if sigma_data: print(f" sigma_data={sigma_data:.6f}")
+
+    # ── Freeze cross_attn, train everything else ─────────────────────
+    if hasattr(raw_model, 'cross_attn_block'):
+        for p in raw_model.cross_attn_block.parameters():
+            p.requires_grad_(False)
+        if is_main(rank): print("[INFO] cross_attn_block FROZEN")
+
+    opt = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                lr=LR, weight_decay=1e-4, betas=(0.9, 0.999))
+    scaler = GradScaler(device=dev.type, init_scale=256.0,
+                        growth_interval=500, backoff_factor=0.5)
+    sched = CosineAnnealingWarmRestarts(opt, T_0=75, T_mult=2, eta_min=LR * 0.01)
+
+    if is_main(rank):
+        np_ = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[MODEL] {'Temporal' if USE_TEMPORAL else 'Plain'} regressor "
+              f"{np_/1e6:.2f}M trainable params\n")
+        hdr = f"{'Ep':>6} | {'MSE':>6} | {'wW':>5} | {'wM':>5} | {'wPCC_tr':>7} | {'wPCC_v':>7} | {'DHR':>5} | {'HRMSE':>6}"
+        print(hdr); print("-" * len(hdr))
+
+    for ep in range(start_epoch, EPOCHS):
+        model.train()
+        t0 = time.time()
+        s_mse = s_wpcc = 0.0
+        n_batch = 0
+        n_skipped = 0
+
+        w_mse, w_wpcc = loss_weights(ep)
+
+        for bi, b in enumerate(trl):
+            try:
+                fine = b["fine"].to(dev)
+                topo = b["topo"].to(dev)
+                tf = torch.stack([b["doy"], b["hour"]], 1).float().to(dev)
+                xi = b["coarse"].to(dev)
+
+                fp = fine[:, PRECIP_CH:PRECIP_CH+1]
+                fp_lin = torch.clamp(torch.expm1(fp.clamp(-5, 9)), 0, 1500.0)
+
+                seq = None
+                if USE_TEMPORAL:
+                    if "idx" in b:
+                        seq = build_seq(ds, b["idx"].tolist(), SEQ_LEN, dev)
+                    else:
+                        seq = torch.zeros(fp.shape[0], SEQ_LEN,
+                                          xi.shape[1], xi.shape[2], xi.shape[3], device=dev)
+
+                opt.zero_grad(set_to_none=True)
+
+                with autocast(device_type=dev.type, enabled=True):
+                    if USE_TEMPORAL:
+                        pred_log = model(xi, topo=topo, global_features=tf, seq=seq)
+                    else:
+                        pred_log = model(xi, topo=topo, global_features=tf)
+
+                    pred_lin = torch.clamp(torch.expm1(pred_log.clamp(-5, 9)), 0, 1500.0)
+                    l_mse = mse_log1p(pred_log, fp)
+                    w_val = wpcc(pred_lin, fp_lin)
+                    loss = w_mse * l_mse + w_wpcc * (1.0 - w_val)
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    if is_main(rank):
+                        print(f" [SKIP] ep={ep} bi={bi} loss=nan")
+                    n_skipped += 1
+                    continue
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+
+                prev_scale = scaler.get_scale()
+                scaler.step(opt)
+                scaler.update()
+
+                if scaler.get_scale() < prev_scale:
+                    n_skipped += 1
+
+                ema.update(raw_model)
+
+                with torch.no_grad():
+                    if math.isfinite(l_mse.item()):
+                        s_mse += l_mse.item()
+                        s_wpcc += w_val.item()
+                        n_batch += 1
+
+            except Exception:
+                if is_main(rank):
+                    print(f"\n[ERROR] ep={ep} bi={bi}")
+                    traceback.print_exc()
+                raise
+
+        sched.step()
+        ni = 1.0 / max(n_batch, 1)
+        te  = allreduce_mean(torch.tensor(s_mse  * ni, device=dev), ws).item()
+        tw2 = allreduce_mean(torch.tensor(s_wpcc * ni, device=dev), ws).item()
+
+        # ======================== VALIDATION ========================
+        ema.backup(raw_model); ema.apply(raw_model)
+        model.eval()
+
+        vs = torch.tensor(0., device=dev)
+        vd = torch.tensor(0., device=dev)
+        vh = torch.tensor(0., device=dev)
+        vn = torch.tensor(0, device=dev, dtype=torch.long)
+
+        with torch.no_grad():
+            for bi, b in enumerate(val):
+                if bi >= 30: break
+                fine_v = b["fine"].to(dev)
+                topo_v = b["topo"].to(dev)
+                tf_v = torch.stack([b["doy"], b["hour"]], 1).float().to(dev)
+                xi_v = b["coarse"].to(dev)
+
+                fp_v  = fine_v[:, PRECIP_CH:PRECIP_CH+1]
+                fpl_v = torch.clamp(torch.expm1(fp_v.clamp(-5, 9)), 0, 1500.0)
+
+                seq_v = None
+                if USE_TEMPORAL:
+                    if "idx" in b:
+                        seq_v = build_seq(ds, b["idx"].tolist(), SEQ_LEN, dev)
+                    else:
+                        seq_v = torch.zeros(fp_v.shape[0], SEQ_LEN,
+                                            xi_v.shape[1], xi_v.shape[2], xi_v.shape[3], device=dev)
+                    pred_v = model(xi_v, topo=topo_v, global_features=tf_v, seq=seq_v)
+                else:
+                    pred_v = model(xi_v, topo=topo_v, global_features=tf_v)
+
+                pl_v = torch.clamp(torch.expm1(pred_v.clamp(-5, 9)), 0, 1500.0)
+
+                vs += wpcc(pl_v, fpl_v)
+                vd += dry_hit_rate(pl_v, fpl_v)
+                vh += heavy_rmse(pl_v, fpl_v)
+                vn += 1
+
+        if ws > 1 and dist.is_initialized():
+            for t_ in [vs, vd, vh, vn]:
+                dist.all_reduce(t_, op=dist.ReduceOp.SUM)
+
+        vw   = (vs / vn.clamp(min=1)).item()
+        vdhr = (vd / vn.clamp(min=1)).item()
+        vhrm = (vh / vn.clamp(min=1)).item()
+
+        ema.restore(raw_model)
+        el = time.time() - t0
+
+        if sigma_data is None and is_main(rank):
+            ema.backup(raw_model); ema.apply(raw_model)
+            model.eval()
+            sigma_data = measure_sigma_data(trl, raw_model, dev)
+            ema.restore(raw_model)
+            model.train()
+            print(f" [SIGMA_DATA] measured = {sigma_data:.6f}")
+
+        if is_main(rank) and ep % LOG_EVERY == 0:
+            skip_info = f" skip={n_skipped}" if n_skipped > 0 else ""
+            print(f"{ep:>6} | {te:>6.3f} | {w_wpcc:>5.3f} | {w_mse:>5.3f} | "
+                  f"{tw2:>7.4f} | {vw:>7.4f} | {vdhr:>5.3f} | {vhrm:>6.3f}"
+                  f" [{el:.0f}s]{skip_info}")
+            print(f" [INFO] Skipped {n_skipped} batches this epoch | Current LR: {opt.param_groups[0]['lr']:.2e}")
+
+        if is_main(rank):
+            ckpt = {
+                "epoch":               ep,
+                "model_state_dict":    raw_model.state_dict(),
+                "ema_state_dict":      {k: v.cpu() for k, v in ema.shadow.items()},
+                "optimizer_state_dict": opt.state_dict(),
+                "val_wpcc":            vw,
+                "use_temporal":        USE_TEMPORAL,
+                "seq_len":             SEQ_LEN,
+                "sigma_data":          sigma_data,
+            }
+            torch.save(ckpt, LATEST_PATH)
+
+            if vw > best_wPCC:
+                best_wPCC = vw
+                ema.backup(raw_model); ema.apply(raw_model)
+                best = dict(ckpt)
+                best["model_state_dict"] = raw_model.state_dict()
+                best["ema_state_dict"]   = raw_model.state_dict()
+                torch.save(best, SAVE_PATH)
+                ema.restore(raw_model)
+                print(f" ★ NEW BEST wPCC={vw:.4f} → {SAVE_PATH}")
+
+            if ep > 0 and ep % CKPT_SAVE_EVERY == 0 and vw > 0.0:
+                ep_path = os.path.join(CKPT_DIR, f"regressor_ep{ep:05d}.pth")
+                ema.backup(raw_model); ema.apply(raw_model)
+                ep_ckpt = dict(ckpt)
+                ep_ckpt["model_state_dict"] = raw_model.state_dict()
+                ep_ckpt["ema_state_dict"]   = raw_model.state_dict()
+                torch.save(ep_ckpt, ep_path)
+                ema.restore(raw_model)
+                update_manifest(MANIFEST, ep_path, vw, MAX_CKPTS_KEEP)
+                if os.path.exists(SAVE_PATH):
+                    update_manifest(MANIFEST, SAVE_PATH, best_wPCC, MAX_CKPTS_KEEP)
+
+    if ws > 1 and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    train()
+
+
