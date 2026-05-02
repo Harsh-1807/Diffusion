@@ -1,3 +1,4 @@
+https://claude.ai/chat/40feadf6-e66c-4e6f-88db-94ade445aedb
 # -*- coding: utf-8 -*-
 """
 CorrDiff Network — v11  (Factorized Spatiotemporal Attention)
