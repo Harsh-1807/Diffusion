@@ -1,34 +1,3 @@
-The code has two tiny syntax issues that need fixing before it will run:
-
-Line ~260: print(f"|{vw:>8.4f}|{wpcc:>7.4f}|{crps_v:>8.4f}|{fss_v:>6.3f}"
-→ Add missing psd_r term to match the header:
-print(f"{ep:>5}|{te_ml:>10.5f}|{te_sp:>8.5f}|{te_pc:>8.5f}|{vw:>8.4f}|{wpcc:>7.4f}|{crps_v:>8.4f}|{psd_r:>7.3f}|{fss_v:>6.3f}|{lr_u:>9.2e}|{lr_r:>9.2e} [{el:.0f}s]{star}") 
-.
-
-ddim_sample function missing — it is called in validation/sampling but not defined. Copy it from your previous v2 code (around line 500):
-
-python
-@torch.no_grad()
-def ddim_sample(raw_model, mu, tc, tp, gf, d2m_unet, edm_schedule, dev):
-    B=mu.shape[0]; x_t=torch.randn_like(mu)*SIGMA_DATA
-    sigmas=edm_schedule.to(dev)
-    for i, sigma_cur in enumerate(sigmas):
-        s_cur =sigma_cur.view(1,1,1,1)
-        c_in  =1./torch.sqrt(s_cur**2+SIGMA_DATA**2)
-        c_out =s_cur*SIGMA_DATA/torch.sqrt(s_cur**2+SIGMA_DATA**2)
-        c_skip=SIGMA_DATA**2/(s_cur**2+SIGMA_DATA**2)
-        c_n   =(sigma_cur.log()/4).expand(B)
-        x_in  =torch.cat([x_t,mu,tc],dim=1)
-        D_pred=raw_model(c_in*x_in,c_n,topo=tp,global_features=gf,d2m=d2m_unet,T=T_COND)
-        x0_hat=c_skip*x_t[:,:1]+c_out*D_pred
-        if i<len(sigmas)-1:
-            sigma_next=sigmas[i+1].view(1,1,1,1)
-            x_t=x0_hat+sigma_next*(x_t-x0_hat)/s_cur.clamp(min=1e-8)
-        else:
-            x_t=x0_hat
-    return x_t
-
-
 # -*- coding: utf-8 -*-
 """
 Stage 2: Train CorrDiff UNet  —  Joint End-to-End Tuning
@@ -476,7 +445,7 @@ def train():
               f"ACCUM={ACCUM_STEPS}  eff_batch={BATCH*ACCUM_STEPS}  LAMBDA_PCC={LAMBDA_PCC}")
         print(f"[COND]   UNET_D2M_CH={UNET_D2M_CH} (d2m+var_map_up)  T_COND={T_COND}")
         hdr=(f"{'Ep':>5}|{loss_label:>10}|{'L_spec':>8}|{'L_pcc':>8}"
-             f"|{'Val':>8}|{'wPCC':>7}|{'CRPS':>8}|{'FSS':>6}"
+             f"|{'Val':>8}|{'wPCC':>7}|{'CRPS':>8}|{'PSD_r':>7}|{'FSS':>6}"
              f"|{'LR_u':>9}|{'LR_r':>9}")
         print(hdr); print("-"*len(hdr))
 
@@ -660,7 +629,7 @@ def train():
         if rank==0:
             star=" ★" if wpcc>best_wpcc else ""
             print(f"{ep:>5}|{te_ml:>10.5f}|{te_sp:>8.5f}|{te_pc:>8.5f}"
-                  f"|{vw:>8.4f}|{wpcc:>7.4f}|{crps_v:>8.4f}|{fss_v:>6.3f}"
+                  f"|{vw:>8.4f}|{wpcc:>7.4f}|{crps_v:>8.4f}|{psd_r:>7.3f}|{fss_v:>6.3f}"
                   f"|{lr_u:>9.2e}|{lr_r:>9.2e}  [{el:.0f}s]{star}")
 
             # ── checkpoint: save UNet + Reg + optimizer + EMA ─────────────
