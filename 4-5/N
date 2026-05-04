@@ -1,0 +1,1384 @@
+# -*- coding: utf-8 -*-
+"""
+CorrDiff Network — v11  (D2M-separate + VarMap-separate + DilatedBottleneck)
+=============================================================================
+Changes from v10:
+  * var_map and d2m are now fully SEPARATE paths in BOTH Regressor and UNet.
+
+  REGRESSOR (unchanged from v10):
+    - r_stem   : takes [coarse_precip, var_map] cat at coarse res [B, 2, H/4, W/4]
+    - d_stem   : takes d2m [B, 1, H, W]  (fine res, separate)
+
+  UNET (new in v11):
+    - x_in     : noisy_residual + mu + temporal_frames  (no d2m or var_map in head)
+    - d_stem   : takes d2m [B, 1, H, W]  → projects to base_channels, adds after head
+    - v_stem   : takes var_map [B, 1, H/4, W/4] → upsamples ×4, projects, adds after head
+    - Both stems are zero-gated at init → identity → safe resume from v10 checkpoints
+
+  train.py changes needed:
+    - UNET_D2M_CH = 1  (back to 1, not 2)
+    - build_unet_d2m() removed; pass d2m and var_map separately to UNet.forward()
+    - UNet forward: v_pred = model(..., d2m=d2m, var_map=var_map)
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Utility
+# ────────────────────────────────────────────────────────────────────────────
+
+def _g(ch, mx=32):
+    for g in range(min(mx, ch), 0, -1):
+        if ch % g == 0:
+            return g
+    return 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Building blocks
+# ────────────────────────────────────────────────────────────────────────────
+
+class SEBlock(nn.Module):
+    def __init__(self, ch, r=8):
+        super().__init__()
+        self.p = nn.AdaptiveAvgPool2d(1)
+        self.f = nn.Sequential(
+            nn.Linear(ch, max(4, ch // r), bias=False), nn.ReLU(inplace=True),
+            nn.Linear(max(4, ch // r), ch, bias=False), nn.Sigmoid())
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        return x * self.f(self.p(x).view(b, c)).view(b, c, 1, 1)
+
+
+class CoordConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size, padding=padding)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        yg = torch.linspace(-1, 1, h, device=x.device).view(1, 1, h, 1).expand(b, 1, h, w)
+        xg = torch.linspace(-1, 1, w, device=x.device).view(1, 1, 1, w).expand(b, 1, h, w)
+        return self.conv(torch.cat([x, yg, xg], dim=1))
+
+
+class FourierFilter(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.complex_weight = nn.Parameter(torch.randn(channels, channels, 2) * 0.02)
+        self.norm = nn.GroupNorm(_g(channels), channels)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_fft = torch.fft.rfft2(self.norm(x))
+        weight = torch.view_as_complex(self.complex_weight)
+        out_fft = torch.einsum('bchw,cd->bdhw', x_fft, weight)
+        return x + self.proj(torch.fft.irfft2(out_fft, s=(H, W)))
+
+
+class ResConv(nn.Module):
+    def __init__(self, ic, oc):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.GroupNorm(_g(ic), ic), nn.SiLU(),
+            nn.Conv2d(ic, oc, 3, padding=1),
+            nn.GroupNorm(_g(oc), oc), nn.SiLU(),
+            nn.Conv2d(oc, oc, 3, padding=1))
+        self.skip = nn.Conv2d(ic, oc, 1) if ic != oc else nn.Identity()
+        self.se = SEBlock(oc)
+
+    def forward(self, x):
+        return self.skip(x) + self.se(self.net(x))
+
+
+class BnAttn(nn.Module):
+    def __init__(self, ch, heads=4):
+        super().__init__()
+        while ch % heads != 0 and heads > 1:
+            heads -= 1
+        self.h = heads
+        self.s = 8
+        self.scale = (ch // heads) ** -0.5
+        self.norm = nn.GroupNorm(_g(ch), ch)
+        self.qkv = nn.Conv2d(ch, ch * 3, 1, bias=False)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        s = min(self.s, H)
+        lo = F.adaptive_avg_pool2d(self.norm(x), (s, s))
+        qkv = self.qkv(lo).reshape(B, 3, self.h, C // self.h, s * s)
+        q, k, v = qkv.unbind(1)
+        a = torch.einsum('bhdn,bhdm->bhnm', q * self.scale, k).softmax(-1)
+        o = torch.einsum('bhnm,bhdm->bhdn', a, v).reshape(B, C, s, s)
+        return x + F.interpolate(self.proj(o), (H, W), mode='bilinear', align_corners=False)
+
+
+class TemporalAttention(nn.Module):
+    def __init__(self, ch, T=4, heads=4):
+        super().__init__()
+        while ch % heads != 0 and heads > 1:
+            heads -= 1
+        self.T = T
+        self.h = heads
+        self.scale = (ch // heads) ** -0.5
+        self.norm = nn.GroupNorm(_g(ch), ch)
+        self.qkv = nn.Linear(ch, ch * 3, bias=False)
+        self.proj = nn.Linear(ch, ch)
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, T=None):
+        T = T or self.T
+        BT, C, H, W = x.shape
+        if BT % T != 0:
+            return x
+        B = BT // T
+        tok = F.adaptive_avg_pool2d(self.norm(x), 1).view(BT, C).view(B, T, C)
+        qkv = self.qkv(tok).reshape(B, T, 3, self.h, C // self.h)
+        q, k, v = qkv.unbind(2)
+        a = torch.einsum('bthd,bshd->bths', q * self.scale, k).softmax(-1)
+        out = torch.einsum('bths,bshd->bthd', a, v).reshape(B, T, C)
+        out = self.proj(out).view(BT, C, 1, 1)
+        return x + self.gate.tanh() * out
+
+
+class DilatedBottleneck(nn.Module):
+    """ASPP-style multi-rate dilated bottleneck. Zero-init → identity at start."""
+    def __init__(self, in_channels, mid_channels=512):
+        super().__init__()
+        rates = [1, 2, 4, 8]
+        branch_ch = mid_channels // len(rates)
+        self.branches = nn.ModuleList()
+        for rate in rates:
+            self.branches.append(nn.Sequential(
+                nn.Conv2d(in_channels, branch_ch, kernel_size=3,
+                          padding=rate, dilation=rate, bias=False),
+                nn.GroupNorm(_g(branch_ch), branch_ch),
+                nn.SiLU(),
+            ))
+        self.project = nn.Sequential(
+            nn.Conv2d(branch_ch * len(rates), in_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_g(in_channels), in_channels),
+        )
+        nn.init.zeros_(self.project[0].weight)
+
+    def forward(self, x):
+        out = torch.cat([branch(x) for branch in self.branches], dim=1)
+        return x + self.project(out)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# REGRESSOR  (Stage 1) — unchanged from v10
+# Inputs:
+#   x    = [coarse_precip, var_map] cat at [B, 2, H/4, W/4]  → r_stem (upsample ×4)
+#   topo = [B, 3, H, W]                                       → t_stem
+#   d2m  = [B, 1, H, W]                                       → d_stem (separate)
+# ════════════════════════════════════════════════════════════════════════════
+
+class CorrDiffRegressor(nn.Module):
+    def __init__(self, in_channels=2, out_channels=1, base_channels=64,
+                 channel_mult=(1, 2, 4), num_blocks=2, global_dim=2,
+                 topo_channels=3, d2m_channels=1, use_d2m=True, **kw):
+        super().__init__()
+        cms = list(channel_mult)
+        st = base_channels
+        emb = base_channels * 2
+        self.use_d2m = use_d2m
+
+        self.g_mlp = nn.Sequential(
+            nn.Linear(global_dim, emb), nn.SiLU(), nn.Linear(emb, st)
+        ) if global_dim > 0 else None
+
+        # r_stem: upsample coarse [B,2,H/4,W/4] → [B,st,H,W]
+        self.r_stem = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+            CoordConv2d(in_channels, st, 3, padding=1),
+            nn.GroupNorm(_g(st), st), nn.SiLU())
+
+        # t_stem: topo [B,3,H,W] → [B,st,H,W]
+        self.t_stem = nn.Sequential(
+            CoordConv2d(topo_channels, st, 3, padding=1),
+            nn.GroupNorm(_g(st), st), nn.SiLU())
+
+        # d_stem: d2m [B,1,H,W] → [B,st,H,W]  (separate from r_stem)
+        if use_d2m:
+            self.d_stem = nn.Sequential(
+                CoordConv2d(d2m_channels, st, 3, padding=1),
+                nn.GroupNorm(_g(st), st), nn.SiLU())
+
+        self.r_enc = nn.ModuleList()
+        self.t_enc = nn.ModuleList()
+        self.r_dn  = nn.ModuleList()
+        self.t_dn  = nn.ModuleList()
+        self.sk_ch = []
+        rc = tc = st
+
+        for li, m in enumerate(cms):
+            oc = base_channels * m
+            rb = nn.ModuleList()
+            tb = nn.ModuleList()
+            for _ in range(num_blocks):
+                rb.append(ResConv(rc, oc))
+                tb.append(ResConv(tc, oc))
+                rc = tc = oc
+            self.r_enc.append(rb)
+            self.t_enc.append(tb)
+            self.sk_ch.append(rc + tc)
+            last = (li == len(cms) - 1)
+            self.r_dn.append(nn.Identity() if last else nn.Conv2d(rc, rc, 4, 2, 1))
+            self.t_dn.append(nn.Identity() if last else nn.Conv2d(tc, tc, 4, 2, 1))
+
+        bn = base_channels * cms[-1]
+        self.bn_proj = nn.Conv2d(rc + tc, bn, 1)
+        self.bn_attn = BnAttn(bn, max(1, bn // 64))
+        self.bn_se   = SEBlock(bn)
+        self.bn_mid  = ResConv(bn, bn)
+
+        self.d_ups = nn.ModuleList()
+        self.d_blk = nn.ModuleList()
+        dc = bn
+
+        for li, m in reversed(list(enumerate(cms))):
+            oc = base_channels * m
+            sc = self.sk_ch[li]
+            self.d_ups.append(
+                nn.Identity() if li == len(cms) - 1 else
+                nn.Sequential(nn.ConvTranspose2d(dc, dc, 4, 2, 1),
+                               nn.GroupNorm(_g(dc), dc), nn.SiLU()))
+            blks = nn.ModuleList()
+            ic2 = dc + sc
+            for _ in range(num_blocks):
+                blks.append(ResConv(ic2, oc))
+                ic2 = oc
+            self.d_blk.append(blks)
+            dc = oc
+
+        self.out = nn.Sequential(
+            nn.GroupNorm(_g(dc), dc), nn.SiLU(),
+            nn.Conv2d(dc, out_channels, 3, padding=1))
+        nn.init.zeros_(self.out[-1].bias)
+
+    def forward(self, x, topo, global_features=None, d2m=None):
+        # x = cat([coarse, var_map], dim=1) at coarse res — caller's job
+        r = self.r_stem(x)
+        t = self.t_stem(topo)
+
+        # d2m added to r after alignment — separate path
+        if self.use_d2m and d2m is not None:
+            d2m_aligned = F.interpolate(d2m, size=r.shape[-2:],
+                                        mode='bilinear', align_corners=False)
+            r = r + self.d_stem(d2m_aligned)
+
+        if self.g_mlp is not None and global_features is not None:
+            gs = self.g_mlp(global_features)[:, :, None, None]
+            r = r + gs
+            t = t + gs
+
+        rs, ts = [], []
+        for li in range(len(self.r_enc)):
+            for rb, tb in zip(self.r_enc[li], self.t_enc[li]):
+                r = rb(r)
+                t = tb(t)
+            rs.append(r); ts.append(t)
+            r = self.r_dn[li](r)
+            t = self.t_dn[li](t)
+
+        f = self.bn_proj(torch.cat([r, t], 1))
+        f = self.bn_attn(f); f = self.bn_se(f); f = self.bn_mid(f)
+        d = f
+
+        for li, (up, blks) in enumerate(zip(self.d_ups, self.d_blk)):
+            lv = len(self.r_enc) - 1 - li
+            d = up(d)
+            d = torch.cat([d, torch.cat([rs[lv], ts[lv]], 1)], 1)
+            for b in blks:
+                d = b(d)
+
+        return self.out(d)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# UNET  (Stage 2) — v11: d2m and var_map are FULLY SEPARATE stems
+#
+# Signal flow:
+#   x_in  = cat([noisy_res, mu, temporal_frames])  → head → h
+#   d2m   = [B, 1, H, W]   → d_stem → adds to h   (fine res atmospheric mask)
+#   var_map=[B, 1, H/4,W/4]→ v_stem (upsample ×4) → adds to h  (coarse climatology)
+#   topo  = [B, 3, H, W]   → FiLM conditioning in every ResBlock
+#
+# Why separate:
+#   d2m   lives at fine res → convective boundary mask, no upsampling needed
+#   var_map lives at coarse → climatological uncertainty, upsampled internally
+#   Mixing them destroys both signals.
+# ════════════════════════════════════════════════════════════════════════════
+
+class ResBlock(nn.Module):
+    def __init__(self, ic, oc, ec, down=False, up=False,
+                 use_topo=True, topo_channels=3, dropout=0.1):
+        super().__init__()
+        self.rs = None
+        if down: self.rs = nn.Conv2d(ic, ic, 4, 2, 1)
+        if up:   self.rs = nn.ConvTranspose2d(ic, ic, 4, 2, 1)
+        self.n1 = nn.GroupNorm(_g(ic), ic)
+        self.c1 = nn.Conv2d(ic, oc, 3, padding=1)
+        self.ep = nn.Linear(ec, oc)
+        self.use_topo = use_topo
+        if use_topo:
+            self.topo_proj = nn.Conv2d(topo_channels, oc * 2, kernel_size=3, padding=1)
+            nn.init.zeros_(self.topo_proj.weight)
+            nn.init.zeros_(self.topo_proj.bias)
+        self.n2 = nn.GroupNorm(_g(oc), oc)
+        self.dropout = nn.Dropout(dropout)
+        self.c2 = nn.Conv2d(oc, oc, 3, padding=1)
+        self.se = SEBlock(oc)
+        self.sk = nn.Conv2d(ic, oc, 1) if ic != oc else nn.Identity()
+
+    def forward(self, x, e, topo=None):
+        if self.rs: x = self.rs(x)
+        h = self.c1(F.silu(self.n1(x))) + self.ep(F.silu(e))[:, :, None, None]
+        h_norm = self.n2(h)
+        
+        if self.use_topo and topo is not None:
+            t_res = F.interpolate(topo, size=h.shape[-2:], mode='bilinear', align_corners=False)
+            gamma, beta = self.topo_proj(t_res).chunk(2, dim=1)
+            h_norm = h_norm * (1 + torch.tanh(gamma)) + beta
+            
+        h_norm = self.dropout(h_norm)
+        return self.se(self.c2(F.silu(h_norm))) + self.sk(x)
+
+
+class UNet(nn.Module):
+    """
+    v11 UNet: d2m and var_map enter via dedicated stems, NOT concatenated together.
+
+    Constructor args:
+      in_channels   : noisy_res + mu + T_COND  (no d2m or var_map here)
+      d2m_channels  : 1  (raw d2m only)
+      var_map_channels: 1 (raw var_map at coarse res)
+      use_d2m       : bool
+      use_var_map   : bool
+
+    Both d_stem and v_stem are zero-gated → identity at init → safe resume.
+    """
+    def __init__(self, in_channels, out_channels, base_channels=128,
+                 channel_mult=(1, 2, 2, 4), num_res_blocks=2, dropout=0.1,
+                 num_blocks=None, global_dim=2, use_bottleneck_attention=True,
+                 topo_channels=3, use_d2m=True, d2m_channels=1,
+                 use_var_map=True, var_map_channels=1,
+                 temporal_frames=3, **kw):
+        super().__init__()
+        nrb = num_blocks if num_blocks else num_res_blocks
+        ec  = base_channels * 4
+        self.topo_channels  = topo_channels
+        self.use_d2m        = use_d2m
+        self.use_var_map    = use_var_map
+        self.temporal_frames = temporal_frames
+
+        # head: x only (no d2m/var_map concatenated in)
+        head_in = in_channels
+
+        # ── embeddings ────────────────────────────────────────────
+        self.t_emb = nn.Sequential(
+            nn.Linear(base_channels, ec), nn.SiLU(), nn.Linear(ec, ec))
+        self.g_mlp = nn.Sequential(
+            nn.Linear(global_dim, ec), nn.SiLU()) if global_dim else None
+
+        # ── d_stem: d2m [B,1,H,W] → [B,base_channels,H,W] ───────
+        # Fine-resolution atmospheric boundary signal
+        if use_d2m:
+            self.d_stem = nn.Sequential(
+                CoordConv2d(d2m_channels, base_channels, 3, padding=1),
+                nn.GroupNorm(_g(base_channels), base_channels), nn.SiLU())
+            # Zero gate: d_stem output is zeroed at init → identity
+            self.d_gate = nn.Parameter(torch.zeros(1))
+
+        # ── v_stem: var_map [B,1,H/4,W/4] → upsample → [B,base_channels,H,W] ──
+        # Coarse climatological uncertainty, upsampled to fine res here
+        if use_var_map:
+            self.v_stem = nn.Sequential(
+                nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False),
+                CoordConv2d(var_map_channels, base_channels, 3, padding=1),
+                nn.GroupNorm(_g(base_channels), base_channels), nn.SiLU())
+            # Zero gate → identity at init → safe resume
+            self.v_gate = nn.Parameter(torch.zeros(1))
+
+        # ── encoder ──────────────────────────────────────────────
+        self.head = CoordConv2d(head_in, base_channels, 3, padding=1)
+        self.downs = nn.ModuleList()
+        self.ups   = nn.ModuleList()
+        ch = base_channels
+        sk = []
+
+        for m in channel_mult:
+            oc = base_channels * m
+            for _ in range(nrb):
+                self.downs.append(ResBlock(ch, oc, ec,
+                                           topo_channels=topo_channels, dropout=dropout))
+                ch = oc; sk.append(ch)
+            self.downs.append(ResBlock(ch, ch, ec, down=True,
+                                       topo_channels=topo_channels, dropout=dropout))
+            sk.append(ch)
+
+        # ── bottleneck ───────────────────────────────────────────
+        self.m1 = ResBlock(ch, ch, ec, topo_channels=topo_channels, dropout=dropout)
+        self.ma = BnAttn(ch, max(1, ch // 64)) if use_bottleneck_attention else nn.Identity()
+        self.fft = FourierFilter(ch)
+        mid_ch = min(512, ch)
+        self.dilated_bottleneck = DilatedBottleneck(in_channels=ch, mid_channels=mid_ch)
+        self.m2 = ResBlock(ch, ch, ec, topo_channels=topo_channels, dropout=dropout)
+
+        # ── decoder ──────────────────────────────────────────────
+        for m in reversed(channel_mult):
+            oc = base_channels * m
+            self.ups.append(ResBlock(ch + sk.pop(), oc, ec, up=True,
+                                     topo_channels=topo_channels, dropout=dropout))
+            ch = oc
+            for _ in range(nrb):
+                self.ups.append(ResBlock(ch + sk.pop(), oc, ec,
+                                         topo_channels=topo_channels, dropout=dropout))
+                ch = oc
+
+        self.out = nn.Sequential(
+            nn.GroupNorm(_g(ch), ch), nn.SiLU(),
+            nn.Conv2d(ch, out_channels, 3, padding=1))
+
+    def _temb(self, t):
+        half = self.t_emb[0].in_features // 2
+        freq = torch.exp(
+            torch.arange(half, device=t.device) * (-math.log(10000) / (half - 1)))
+        e = t.unsqueeze(1) * freq.unsqueeze(0) * 2 * math.pi
+        return self.t_emb(torch.cat([e.sin(), e.cos()], -1))
+
+    def forward(self, x, t, topo=None, global_features=None,
+                cfg_drop=None, d2m=None, var_map=None, T=None):
+        T = T or self.temporal_frames
+        emb = self._temb(t)
+
+        if global_features is not None and self.g_mlp:
+            gf = global_features.clone()
+            if cfg_drop is not None:
+                gf[cfg_drop] = 0.
+            emb = emb + self.g_mlp(gf)
+
+        x_in    = x.clone()
+        topo_in = topo.clone() if topo is not None else None
+
+        if cfg_drop is not None and cfg_drop.any():
+            x_in[cfg_drop, 1:] = 0.
+            if topo_in is not None:
+                topo_in[cfg_drop] = 0.
+
+        # head: process noisy input only
+        h = self.head(x_in)
+
+        # ── d_stem: d2m → fine-res atmospheric mask ──────────────
+        if self.use_d2m and d2m is not None:
+            d2m_in = d2m.clone()
+            if cfg_drop is not None and cfg_drop.any():
+                d2m_in[cfg_drop] = 0.
+            d2m_res = F.interpolate(d2m_in, size=h.shape[-2:],
+                                    mode='bilinear', align_corners=False)
+            h = h + self.d_gate.tanh() * self.d_stem(d2m_res)
+
+        # ── v_stem: var_map → coarse climatology upsampled ───────
+        if self.use_var_map and var_map is not None:
+            vm_in = var_map.clone()
+            if cfg_drop is not None and cfg_drop.any():
+                vm_in[cfg_drop] = 0.
+            # v_stem includes Upsample(×4) internally — no manual resize needed
+            h = h + self.v_gate.tanh() * self.v_stem(vm_in)
+
+        sk = [h]
+        for layer in self.downs:
+            h = layer(h, emb, topo_in)
+            sk.append(h)
+
+        # ── bottleneck ───────────────────────────────────────────
+        h = self.m1(h, emb, topo_in)
+        h = self.ma(h) if isinstance(self.ma, BnAttn) else h
+        h = self.fft(h)
+        h = self.dilated_bottleneck(h)
+        h = self.m2(h, emb, topo_in)
+
+        for layer in self.ups:
+            h = torch.cat([h, sk.pop()], 1)
+            h = layer(h, emb, topo_in)
+
+        return self.out(h)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Flow Matching
+# ════════════════════════════════════════════════════════════════════════════
+
+class FlowMatching:
+    def __init__(self, n_steps=6, cfg_scale=2.5):
+        self.n_steps = n_steps
+        self.cfg_scale = cfg_scale
+
+    def get_train_sample(self, x1):
+        B = x1.shape[0]
+        x0 = torch.randn_like(x1)
+        alpha = torch.distributions.Beta(1.5, 1.5).sample((B,)).to(x1.device)
+        t = alpha.view(B, 1, 1, 1)
+        x_t = (1 - t) * x0 + t * x1
+        v_target = x1 - x0
+        return x_t, alpha, v_target
+
+    @torch.no_grad()
+    def sample(self, model, x_cond, topo, global_features=None,
+               d2m=None, var_map=None, cfg_scale=None, T=1):
+        cfg = cfg_scale or self.cfg_scale
+        B, _, H, W = x_cond.shape
+        x = torch.randn(B, 1, H, W, device=x_cond.device)
+        dt = 1.0 / self.n_steps
+
+        for i in range(self.n_steps):
+            t_vec = torch.full((B,), i * dt, device=x.device)
+            x_in  = torch.cat([x, x_cond], dim=1)
+            v_c   = model(x_in, t_vec, topo=topo, global_features=global_features,
+                          d2m=d2m, var_map=var_map, T=T)
+            if cfg > 1.0:
+                x_unc = torch.cat([x, torch.zeros_like(x_cond)], dim=1)
+                mask  = torch.ones(B, dtype=torch.bool, device=x.device)
+                v_u   = model(x_unc, t_vec, topo=topo, global_features=global_features,
+                              d2m=d2m, var_map=var_map, cfg_drop=mask, T=T)
+                v = v_u + cfg * (v_c - v_u)
+            else:
+                v = v_c
+            x = x + dt * v
+            x = torch.clamp(x, min=-1.0, max=7.0)
+
+        return x
+
+    @staticmethod
+    def loss(v_pred, v_target):
+        return F.mse_loss(v_pred, v_target)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Physics Guidance
+# ════════════════════════════════════════════════════════════════════════════
+
+class PhysicsGuide:
+    DRY_THRESH_LOG = 0.01
+
+    @staticmethod
+    def apply(pred_log, coarse_log, enforce_mass=True, enforce_dry=True):
+        pred = pred_log.clamp(min=0.)
+        if enforce_dry:
+            coarse_mean = coarse_log.mean(dim=[-2, -1], keepdim=True)
+            dry_mask = coarse_mean < PhysicsGuide.DRY_THRESH_LOG
+            pred = pred * (~dry_mask).float()
+        if enforce_mass:
+            pred_phys   = torch.expm1(pred.clamp(0))
+            coarse_phys = torch.expm1(coarse_log.clamp(0))
+            coarse_up   = F.interpolate(coarse_phys, size=pred.shape[-2:],
+                                        mode='bilinear', align_corners=False)
+            target_mean = coarse_up.mean(dim=[-2, -1], keepdim=True).clamp(1e-6)
+            pred_mean   = pred_phys.mean(dim=[-2, -1], keepdim=True).clamp(1e-6)
+            scale = (target_mean / pred_mean).clamp(0.1, 10.0)
+            pred = torch.log1p((pred_phys * scale).clamp(0))
+        return pred
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# QDM
+# ════════════════════════════════════════════════════════════════════════════
+
+class QDM:
+    def __init__(self, n_quantiles=1000, clip_min=0.):
+        self.n = n_quantiles
+        self.clip = clip_min
+        self.q = torch.linspace(0., 1., n_quantiles)
+        self.cm = self.co = None
+        self._fitted = False
+
+    def fit(self, mp, op):
+        mp_flat = mp.flatten().float().cpu()
+        op_flat = op.flatten().float().cpu()
+        max_elements = 15000000
+        if op_flat.numel() > max_elements:
+            indices  = torch.randperm(op_flat.numel())[:max_elements]
+            op_sampled = op_flat[indices]; mp_sampled = mp_flat[indices]
+        else:
+            op_sampled = op_flat; mp_sampled = mp_flat
+        self.cm = torch.quantile(mp_sampled, self.q)
+        self.co = torch.quantile(op_sampled, self.q)
+        self._fitted = True
+        i95 = int(.95 * self.n); i99 = int(.99 * self.n)
+        print(f"[QDM] P95 model={self.cm[i95]:.2f} obs={self.co[i95]:.2f} | "
+              f"P99 model={self.cm[i99]:.2f} obs={self.co[i99]:.2f}")
+
+    @torch.no_grad()
+    def apply(self, pred):
+        assert self._fitted
+        dev = pred.device
+        cm  = self.cm.to(dev); co = self.co.to(dev)
+        x   = pred.flatten().float()
+        idx = torch.searchsorted(cm.contiguous(), x.contiguous()).clamp(0, self.n - 1)
+        return (co[idx] * (x / cm[idx].clamp(1e-6)).clamp(0, 10)).clamp(self.clip) \
+                   .reshape(pred.shape).to(pred.dtype)
+
+    def save(self, p):
+        torch.save({"cm": self.cm, "co": self.co, "n": self.n, "clip": self.clip}, p)
+
+    @classmethod
+    def load(cls, p):
+        d = torch.load(p, map_location="cpu")
+        q = cls(d["n"], d["clip"])
+        q.cm = d["cm"]; q.co = d["co"]; q._fitted = True
+        return q    # -*- coding: utf-8 -*-
+"""
+Stage 2: Train CorrDiff UNet  (Flow-Matching Corrector  OR  CorrDiff Residual)
+===============================================================================
+DUAL-MODE TRAINER  ──  plug-and-play, 4 × H100, anti-overfit
+
+CHANGES vs previous version
+────────────────────────────
+  * ARCHITECTURE  : v11 Multi-Stem. d2m and var_map passed as separate 1-ch inputs.
+  * LOSS          : Pure generative objective. Explicit PCC/Spectral penalties removed.
+  * CHECKPOINTING : best.pth is now saved based on MINIMUM Validation Loss, not wPCC.
+  * T_COND        : 5  (more temporal history)
+  * ACCUM_STEPS   : 2  (effective batch ×2 → smoother gradients)
+  * LR            : 1e-4 
+  * DataLoader    : persistent_workers=True, prefetch_factor=2
+  * Data transfers: non_blocking=True everywhere
+  * cudnn.benchmark: True (fastest cuDNN kernels)
+  * EMA           : updated every optimizer step
+"""
+
+import os
+import math
+import time
+import argparse
+import traceback
+import warnings
+from copy import deepcopy
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+try:
+    import albumentations as A
+    HAS_ALB = True
+except ImportError:
+    HAS_ALB = False
+    warnings.warn("albumentations not found. pip install albumentations opencv-python-headless")
+
+from Dataset import UpscaleDataset
+from HybridNetwork import CorrDiffRegressor, UNet, FlowMatching, PhysicsGuide, QDM
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0.  MODE TOGGLE
+# ══════════════════════════════════════════════════════════════════════════════
+TRAIN_MODE = os.environ.get("TRAIN_MODE", "corrdiff_residual")
+assert TRAIN_MODE in ("flow_matching", "corrdiff_residual"), \
+    f"Bad TRAIN_MODE={TRAIN_MODE!r}"
+
+SIGMA_DATA = 0.1925  # Stage-1 residual std — do NOT change
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  PATHS
+# ══════════════════════════════════════════════════════════════════════════════
+RF_PATH  = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/RF_1975to2023.nc"
+ORO_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/oro.nc"
+D2M_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/era5_aligned_to_rf.nc"
+REG_CKPT = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/Variance/checkpoints/regressor/regressor_best.pth"
+CKPT_DIR = "checkpoints/"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  HYPER-PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+BATCH        = 16
+ACCUM_STEPS  = 2
+LR           = 1e-4
+MIN_LR       = LR * 0.01
+EPOCHS       = 1500
+PATIENCE     = 200
+T_COND       = 5
+PRECIP_CH    = 0
+BASE_CH      = 256
+CHANNEL_MULT = (1, 2, 2, 4)
+NRB          = 2
+DROPOUT      = 0.15
+FM_STEPS     = 6
+CFG_SCALE    = 1.5
+P_CFG_DROP   = 0.15
+WEIGHT_DECAY = 1e-3
+GRAD_CLIP    = 1.0
+EMA_DECAY    = 0.9995
+N_ENS        = 2
+REG_IN_CH    = 2            # regressor coarse input channels (precip + var_map)
+REG_D2M_CH   = 1            # regressor d2m channels (unchanged)
+D2M_CH       = 1            # raw d2m channels in dataset
+UNET_D2M_CH  = 1            # v11 UNet gets separate 1-channel d2m
+UNET_VAR_MAP_CH = 1         # v11 UNet gets separate 1-channel var_map
+TOPO_CH      = 3
+GLOBAL_DIM   = 2
+UNET_IN_CH   = 1 + 1 + T_COND   # noisy_res + mu + temporal_frames = 7
+DS_FACTOR    = 4                # downscale factor (must match Dataset)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  EDM NOISE SCHEDULE
+# ══════════════════════════════════════════════════════════════════════════════
+def build_edm_schedule(n_steps, sigma_min=0.002, sigma_data=SIGMA_DATA, rho=7.0):
+    sigma_max = 2.0 * sigma_data
+    steps = torch.arange(n_steps, dtype=torch.float32) / max(n_steps - 1, 1)
+    return (sigma_max**(1/rho) + steps*(sigma_min**(1/rho) - sigma_max**(1/rho)))**rho
+
+_EDM_CPU = build_edm_schedule(FM_STEPS)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  EMA
+# ══════════════════════════════════════════════════════════════════════════════
+class EMA:
+    def __init__(self, model, decay=EMA_DECAY):
+        self.decay  = decay
+        self.shadow = {k: v.clone().detach().float() for k, v in model.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1-self.decay)
+
+    def apply_to(self, model):
+        model.load_state_dict({k: v.to(next(model.parameters()).device)
+                               for k, v in self.shadow.items()})
+
+    def restore(self, model, state):
+        model.load_state_dict(state)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  AUGMENTATION  ──  CONSISTENT ACROSS ALL SPATIAL INPUTS
+# ══════════════════════════════════════════════════════════════════════════════
+def _make_aug_pipeline():
+    if not HAS_ALB:
+        return None
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1,
+                           rotate_limit=10, border_mode=0, p=0.4),
+        A.ElasticTransform(alpha=1.2, sigma=50.0, p=0.25),
+        A.GridDistortion(num_steps=5, distort_limit=0.15, p=0.2),
+        A.RandomBrightnessContrast(brightness_limit=0.1,
+                                   contrast_limit=0.1, p=0.4),
+        A.GaussNoise(var_limit=(1e-5, 5e-4), p=0.25),
+    ], additional_targets={
+        "topo": "image",
+        "d2m":  "image",
+    })
+
+_AUG_PIPELINE = _make_aug_pipeline()
+
+def augment_sample(fp_t, topo_t, d2m_t, aug_prob=0.5):
+    def _rederive_coarse(fp):
+        return F.avg_pool2d(fp.unsqueeze(0),
+                            kernel_size=DS_FACTOR, stride=DS_FACTOR).squeeze(0)
+
+    if _AUG_PIPELINE is None or np.random.rand() > aug_prob:
+        return fp_t, topo_t, _rederive_coarse(fp_t), d2m_t
+
+    fp_np   = fp_t.squeeze(0).numpy().astype(np.float32)
+    topo_np = topo_t.squeeze(0).numpy().astype(np.float32)
+    d2m_np  = (d2m_t.squeeze(0).numpy().astype(np.float32)
+               if d2m_t is not None else np.zeros_like(fp_np))
+
+    result   = _AUG_PIPELINE(image=fp_np, topo=topo_np, d2m=d2m_np)
+    fp_aug   = torch.from_numpy(result["image"]).unsqueeze(0)
+    topo_aug = torch.from_numpy(result["topo"]).unsqueeze(0)
+    d2m_aug  = (torch.from_numpy(result["d2m"]).unsqueeze(0)
+                if d2m_t is not None else None)
+    coarse_aug = _rederive_coarse(fp_aug)
+    return fp_aug, topo_aug, coarse_aug, d2m_aug
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  TOPO HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  TOPO HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+# Replace dynamic min/max with global constants for the Indian subcontinent
+def compute_slope_aspect(elev, global_elev_max=8600.0, global_slope_max=1.5):
+    # 1. Define Sobel kernels
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32,
+                       device=elev.device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32,
+                       device=elev.device).view(1, 1, 3, 3)
+    
+    # 2. Compute gradients
+    e = elev.float()
+    dx = F.conv2d(e, kx, padding=1)
+    dy = F.conv2d(e, ky, padding=1)
+    slope = torch.sqrt(dx**2 + dy**2 + 1e-8)
+    aspect = torch.atan2(dy, dx)
+    
+    # 3. Global normalization function
+    def global_norm(t, g_min, g_max):
+        return 2 * (t - g_min) / (g_max - g_min + 1e-8) - 1
+
+    # 4. Return concatenated and globally normalized features
+    # Aspect is mathematically [-pi, pi]
+    return torch.cat([
+        global_norm(e, 0.0, global_elev_max), 
+        global_norm(slope, 0.0, global_slope_max), 
+        aspect / math.pi  # natural circular normalization
+    ], dim=1)
+
+def expand_topo(topo_1ch):
+    return torch.cat([compute_slope_aspect(topo_1ch[i:i+1])
+                      for i in range(topo_1ch.shape[0])], dim=0)
+
+def build_coarse_input(coarse, var_map):
+    Hc, Wc = coarse.shape[-2], coarse.shape[-1]
+    return torch.cat([coarse, F.adaptive_avg_pool2d(var_map, (Hc, Wc))], dim=1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  TEMPORAL CONDITIONING
+# ══════════════════════════════════════════════════════════════════════════════
+def build_temporal_cond(batch, dev, n_frames=T_COND):
+    if "tc_frames" in batch:
+        tc = batch["tc_frames"].to(dev, non_blocking=True)
+        if tc.shape[1] >= n_frames:
+            return tc[:, :n_frames]
+        pad = torch.zeros(tc.shape[0], n_frames-tc.shape[1], *tc.shape[2:], device=dev)
+        return torch.cat([tc, pad], dim=1)
+    coarse    = batch["coarse"].to(dev, non_blocking=True)
+    coarse_up = F.interpolate(coarse, scale_factor=4, mode='bilinear', align_corners=False)
+    return coarse_up.expand(-1, n_frames, -1, -1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  AUXILIARY LOSSES & METRICS
+# ══════════════════════════════════════════════════════════════════════════════
+def hybrid_sigma_loss(pred, target, sigma):
+    """Pure, simplified EDM denoising loss using L1 for heavy tails."""
+    eps = 1e-6
+    mae = torch.abs(pred.float() - target.float())
+    scaled_mae = (mae / (sigma + eps)).mean()
+    return scaled_mae
+
+@torch.no_grad()
+def weighted_pcc(pred, target, lat_w=None):
+    B = pred.shape[0]
+    p = pred.float().view(B, -1); t = target.float().view(B, -1)
+    if lat_w is not None:
+        w = lat_w.view(1, -1).expand_as(p)
+        w = w / w.sum(dim=1, keepdim=True)
+        pm = (p * w).sum(dim=1, keepdim=True); tm = (t * w).sum(dim=1, keepdim=True)
+        pm_c = p - pm; tm_c = t - tm
+        r = (pm_c * tm_c * w).sum(dim=1) / (
+            torch.sqrt((pm_c**2 * w).sum(dim=1) * (tm_c**2 * w).sum(dim=1)) + 1e-8)
+    else:
+        pm = p.mean(dim=1, keepdim=True); tm = t.mean(dim=1, keepdim=True)
+        pm_c = p - pm; tm_c = t - tm
+        p_l2 = torch.sqrt((pm_c**2).sum(dim=1))
+        t_l2 = torch.sqrt((tm_c**2).sum(dim=1))
+        r = (pm_c * tm_c).sum(dim=1) / (p_l2 * t_l2 + 1e-8)
+    return r.mean().item()
+
+@torch.no_grad()
+def crps_ensemble(samples, target):
+    N=samples.shape[0]
+    mae=(samples-target.unsqueeze(0)).abs().mean(0)
+    pair=(samples.unsqueeze(0)-samples.unsqueeze(1)).abs()
+    return (mae-0.5/N/(N-1)*pair.sum([0,1])).mean().item()
+
+@torch.no_grad()
+def psd_tail_ratio(pred, target, hff=0.3):
+    P=torch.fft.rfft2(pred.float()).abs(); T=torch.fft.rfft2(target.float()).abs()
+    c=int((1-hff)*P.shape[-1])
+    return (P[...,c:].mean()/(T[...,c:].mean()+1e-8)).item()
+
+@torch.no_grad()
+def fractions_skill_score(pred, target, threshold=0.5, window=5):
+    p_bin = (pred > threshold).float()
+    t_bin = (target > threshold).float()
+    p_frac = F.avg_pool2d(p_bin, kernel_size=window, stride=1, padding=window//2)
+    t_frac = F.avg_pool2d(t_bin, kernel_size=window, stride=1, padding=window//2)
+    mse = ((p_frac - t_frac)**2).mean(dim=[-1, -2])
+    ref = (p_frac**2).mean(dim=[-1, -2]) + (t_frac**2).mean(dim=[-1, -2])
+    fss = 1.0 - mse / (ref + 1e-8)
+    return fss.mean().item()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9.  DDP
+# ══════════════════════════════════════════════════════════════════════════════
+def setup():
+    rank=int(os.environ.get("RANK",0)); ws=int(os.environ.get("WORLD_SIZE",1))
+    lr_=int(os.environ.get("LOCAL_RANK",0))
+    if ws>1: dist.init_process_group("nccl"); torch.cuda.set_device(lr_)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True   
+    torch.backends.cudnn.allow_tf32 = True
+    return rank,ws,lr_,torch.device(f"cuda:{lr_}" if torch.cuda.is_available() else "cpu")
+
+def ar(t, ws):
+    if ws>1 and dist.is_initialized(): dist.all_reduce(t,op=dist.ReduceOp.SUM); t/=ws
+    return t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 10.  REGRESSOR LOADER
+# ══════════════════════════════════════════════════════════════════════════════
+def load_regressor(ckpt_path, dev):
+    ck=torch.load(ckpt_path, map_location=dev)
+    reg=CorrDiffRegressor(
+        in_channels=ck.get("reg_in_channels", REG_IN_CH), out_channels=1,
+        base_channels=64, channel_mult=(1,2,4), num_blocks=2,
+        global_dim=GLOBAL_DIM, topo_channels=TOPO_CH,
+        d2m_channels=ck.get("d2m_channels", REG_D2M_CH),   
+        use_d2m=ck.get("use_d2m", True),
+    ).to(dev)
+    state={k.replace("module.",""):v for k,v in ck["model_state_dict"].items()}
+    reg.load_state_dict(state); reg.eval()
+    for p in reg.parameters(): p.requires_grad_(False)
+    return reg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  DDIM SAMPLER  (V2)
+# ══════════════════════════════════════════════════════════════════════════════
+@torch.no_grad()
+def ddim_sample(raw_model, mu, tc, tp, gf, d2m, var_map, edm_schedule, dev):
+    B = mu.shape[0]
+    x_t = torch.randn_like(mu) * SIGMA_DATA
+    sigmas = edm_schedule.to(dev)
+
+    for i, sigma_cur in enumerate(sigmas):
+        s_cur  = sigma_cur.view(1, 1, 1, 1)
+        c_in   = 1. / torch.sqrt(s_cur**2 + SIGMA_DATA**2)
+        c_out  = s_cur * SIGMA_DATA / torch.sqrt(s_cur**2 + SIGMA_DATA**2)
+        c_skip = SIGMA_DATA**2 / (s_cur**2 + SIGMA_DATA**2)
+        c_n    = (sigma_cur.log() / 4).expand(B)
+        x_in   = torch.cat([x_t, mu, tc], dim=1)
+        D_pred = raw_model(c_in * x_in, c_n, topo=tp,
+                           global_features=gf, d2m=d2m, var_map=var_map, T=T_COND)
+        x0_hat = c_skip * x_t[:, :1] + c_out * D_pred
+        if i < len(sigmas) - 1:
+            sigma_next = sigmas[i + 1].view(1, 1, 1, 1)
+            x_t = x0_hat + sigma_next * (x_t - x0_hat) / s_cur.clamp(min=1e-8)
+        else:
+            x_t = x0_hat
+    return x_t
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 12.  TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+def train():
+    rank,ws,lr_,dev=setup()
+    os.makedirs(CKPT_DIR, exist_ok=True)
+
+    SAVE    =os.path.join(CKPT_DIR,f"unet_{TRAIN_MODE}_sigma{SIGMA_DATA:.3f}_best.pth")
+    LATEST  =os.path.join(CKPT_DIR,f"unet_{TRAIN_MODE}_sigma{SIGMA_DATA:.3f}_latest.pth")
+    QDM_PATH=os.path.join(CKPT_DIR,f"qdm_{TRAIN_MODE}.pth")
+
+    edm_schedule=_EDM_CPU.clone()
+
+    ds =UpscaleDataset(RF_PATH,ORO_PATH,d2m_file=D2M_PATH,
+                       split="train",normalize=True,device="cpu")
+    n  =len(ds); trn=int(0.70*n); van=int(0.10*n)
+
+    _loader_kwargs = dict(
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True,   
+        prefetch_factor=2,         
+        drop_last=True,
+    )
+    trl=DataLoader(Subset(ds,range(0,trn)),   BATCH, shuffle=True,  **_loader_kwargs)
+    val=DataLoader(Subset(ds,range(trn,trn+van)), BATCH, shuffle=False,
+                   num_workers=8, pin_memory=True,
+                   persistent_workers=True, prefetch_factor=2)
+
+    reg=load_regressor(REG_CKPT,dev)
+    if rank==0: print(f"[Stage-1] Regressor loaded (frozen)")
+
+    if TRAIN_MODE=="flow_matching":
+        fm=FlowMatching(n_steps=FM_STEPS,cfg_scale=CFG_SCALE); loss_label="L_flow  "
+    else:
+        fm=None; loss_label="L_denoise"
+
+    model=UNet(
+        in_channels=UNET_IN_CH, out_channels=1, base_channels=BASE_CH,
+        channel_mult=CHANNEL_MULT, num_res_blocks=NRB, dropout=DROPOUT,
+        global_dim=GLOBAL_DIM, use_bottleneck_attention=True,
+        topo_channels=TOPO_CH, 
+        use_d2m=True,
+        d2m_channels=UNET_D2M_CH,          
+        use_var_map=True,                  
+        var_map_channels=UNET_VAR_MAP_CH,  
+        temporal_frames=T_COND,
+    ).to(dev)
+
+    if ws>1:
+        model=nn.parallel.DistributedDataParallel(
+            model,device_ids=[lr_],find_unused_parameters=False)
+    raw=model.module if ws>1 else model
+
+    ema   =EMA(raw,decay=EMA_DECAY)
+    opt   =AdamW(model.parameters(),lr=LR,weight_decay=WEIGHT_DECAY,betas=(0.9,0.999))
+    scaler=GradScaler(device=dev.type)
+    sched =CosineAnnealingWarmRestarts(opt,T_0=50,T_mult=1,eta_min=MIN_LR)
+
+    start=0; best_val_loss=float('inf'); no_improve=0
+
+    if os.path.exists(LATEST):
+        ck=torch.load(LATEST,map_location=dev)
+        try:
+            raw.load_state_dict({k.replace("module.",""):v
+                                 for k,v in ck["model_state_dict"].items()})
+        except RuntimeError as e:
+            if rank==0: print(f"[RESUME WARNING] Partial load: {e}")
+        opt.load_state_dict(ck["optimizer_state_dict"])
+        start=ck.get("epoch",0)+1
+        best_val_loss=ck.get("val_loss", float('inf'))
+        no_improve=ck.get("no_improve",0)
+        if "ema_shadow" in ck:
+            ema.shadow={k:v.to(dev) for k,v in ck["ema_shadow"].items()}
+        if rank==0: print(f"[RESUME] ep={start}  best_val_loss={best_val_loss:.4f}")
+
+    if rank==0:
+        np_=sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[MODEL]  UNet {np_/1e6:.2f}M  mode={TRAIN_MODE}  sigma_data={SIGMA_DATA}")
+        print(f"[COND]   UNET_D2M_CH={UNET_D2M_CH}  UNET_VAR_MAP_CH={UNET_VAR_MAP_CH}  T_COND={T_COND}")
+        print(f"[OPTIM]  LR={LR}  ACCUM={ACCUM_STEPS}  eff_batch={BATCH*ACCUM_STEPS}")
+        print(f"[PERF]   cudnn.benchmark=True  tf32=True  persistent_workers=True  prefetch_factor=2")
+        hdr=(f"{'Ep':>5}|{loss_label:>10}|{'ValLoss':>8}|{'wPCC':>7}|{'CRPS':>8}|{'PSD_r':>7}|{'FSS':>6}|{'LR':>9}")
+        print(hdr); print("-"*len(hdr))
+
+    lat_w=None
+
+    for ep in range(start, EPOCHS):
+        model.train()
+        t0=time.time(); sum_ml=nb=0.
+        opt.zero_grad(set_to_none=True)
+        _opt_steps=0   
+
+        for step, b in enumerate(trl, 1):
+            try:
+                fp       = b["fine"].to(dev, non_blocking=True)[:,PRECIP_CH:PRECIP_CH+1]
+                topo_1ch = b["topo"].to(dev, non_blocking=True)
+                xi_raw   = b["coarse"].to(dev, non_blocking=True)
+                d2m      = b["d2m"].to(dev, non_blocking=True) if "d2m" in b else None
+                var_map  = b["var_map"].to(dev, non_blocking=True)
+                gf       = torch.stack([b["doy"],b["hour"]],1).float().to(dev, non_blocking=True)
+                tc       = build_temporal_cond(b, dev)
+
+                if torch.rand(1).item() < 0.5:
+                    fp = fp.flip(-1); topo_1ch = topo_1ch.flip(-1)
+                    if d2m is not None: d2m = d2m.flip(-1)
+                    var_map = var_map.flip(-1)
+                if torch.rand(1).item() < 0.5:
+                    fp = fp.flip(-2); topo_1ch = topo_1ch.flip(-2)
+                    if d2m is not None: d2m = d2m.flip(-2)
+                    var_map = var_map.flip(-2)
+
+                xi_raw = F.avg_pool2d(fp, kernel_size=DS_FACTOR, stride=DS_FACTOR)
+                tp  = expand_topo(topo_1ch)
+                xi  = build_coarse_input(xi_raw, var_map)
+
+                with torch.no_grad():
+                    mu = reg(xi, topo=tp, global_features=gf, d2m=d2m)
+
+                residual = fp - mu
+                cfg_drop = (torch.rand(fp.shape[0], device=dev) < P_CFG_DROP)
+
+                if TRAIN_MODE == "flow_matching":
+                    x_t, t_vec, v_star = fm.get_train_sample(residual)
+                    x_in    = torch.cat([x_t, mu, tc], dim=1)
+                    with autocast(device_type=dev.type):
+                        v_pred   = model(x_in, t_vec, topo=tp, global_features=gf,
+                                         cfg_drop=cfg_drop, d2m=d2m, var_map=var_map, T=T_COND)
+                        loss     = fm.loss(v_pred, v_star) / ACCUM_STEPS
+
+                else:
+                    idx     = torch.randint(0, len(edm_schedule), (fp.shape[0],))
+                    sigma_t = edm_schedule[idx].to(dev).view(-1,1,1,1)
+                    eps     = torch.randn_like(residual)
+                    x_t     = residual + sigma_t*eps
+                    c_in    = 1./torch.sqrt(sigma_t**2 + SIGMA_DATA**2)
+                    c_out   = sigma_t*SIGMA_DATA/torch.sqrt(sigma_t**2 + SIGMA_DATA**2)
+                    c_skip  = SIGMA_DATA**2/(sigma_t**2 + SIGMA_DATA**2)
+                    c_n     = (sigma_t.log()/4).view(fp.shape[0])
+                    x_in    = torch.cat([x_t, mu, tc], dim=1)
+                    with autocast(device_type=dev.type):
+                        D_pred  = model(c_in*x_in, c_n, topo=tp, global_features=gf,
+                                        cfg_drop=cfg_drop, d2m=d2m, var_map=var_map, T=T_COND)
+                        x0_pred = c_skip*x_t[:,:1] + c_out*D_pred
+                        loss    = hybrid_sigma_loss(x0_pred, residual, sigma_t) / ACCUM_STEPS
+
+                scaler.scale(loss).backward()
+
+                if step % ACCUM_STEPS == 0:
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    if not torch.isfinite(loss):
+                        print("Detected NaN loss, skipping batch")
+                        opt.zero_grad(set_to_none=True)
+                        continue 
+                    scaler.step(opt); scaler.update()
+                    opt.zero_grad(set_to_none=True)
+                    ema.update(raw)   
+                    _opt_steps += 1
+
+                with torch.no_grad():
+                    sum_ml+=loss.item()*ACCUM_STEPS; nb+=1
+
+            except Exception:
+                if rank==0: traceback.print_exc()
+                raise
+
+        sched.step()
+        te_ml=ar(torch.tensor(sum_ml/max(nb,1),device=dev),ws).item()
+        lr_now=opt.param_groups[0]["lr"]
+
+        # ── VALIDATION (EMA weights) ──────────────────────────────────────
+        live_state=deepcopy(raw.state_dict()); ema.apply_to(raw); model.eval()
+        v_loss=torch.tensor(0.,device=dev); vn=torch.tensor(0,device=dev,dtype=torch.long)
+        pcc_sum=crps_sum=psd_sum=fss_sum=0.; vb=0
+
+        with torch.no_grad():
+            for b in val:
+                fp      = b["fine"].to(dev, non_blocking=True)[:,PRECIP_CH:PRECIP_CH+1]
+                tp      = expand_topo(b["topo"].to(dev, non_blocking=True))
+                gf      = torch.stack([b["doy"],b["hour"]],1).float().to(dev, non_blocking=True)
+                xi_raw  = b["coarse"].to(dev, non_blocking=True)
+                var_map = b["var_map"].to(dev, non_blocking=True)
+                d2m     = b["d2m"].to(dev, non_blocking=True) if "d2m" in b else None
+                tc      = build_temporal_cond(b, dev)
+                xi      = build_coarse_input(xi_raw, var_map)
+
+                with autocast(device_type=dev.type):
+                    mu = reg(xi, topo=tp, global_features=gf, d2m=d2m)
+
+                residual=fp-mu
+
+                if TRAIN_MODE=="flow_matching":
+                    x_t,t_vec,v_star=fm.get_train_sample(residual)
+                    x_in=torch.cat([x_t,mu,tc],dim=1)
+                    with autocast(device_type=dev.type):
+                        v_pred=model(x_in,t_vec,topo=tp,global_features=gf,
+                                     d2m=d2m,var_map=var_map,T=T_COND)
+                        l_val=fm.loss(v_pred,v_star)
+                else:
+                    idx=torch.randint(0,len(edm_schedule),(fp.shape[0],))
+                    sigma_t=edm_schedule[idx].to(dev).view(-1,1,1,1)
+                    eps=torch.randn_like(residual); x_t=residual+sigma_t*eps
+                    c_in=1./torch.sqrt(sigma_t**2+SIGMA_DATA**2)
+                    c_out=sigma_t*SIGMA_DATA/torch.sqrt(sigma_t**2+SIGMA_DATA**2)
+                    c_skip=SIGMA_DATA**2/(sigma_t**2+SIGMA_DATA**2)
+                    c_n=(sigma_t.log()/4).view(fp.shape[0])
+                    x_in=torch.cat([x_t,mu,tc],dim=1)
+                    with autocast(device_type=dev.type):
+                        D_pred=model(c_in*x_in,c_n,topo=tp,global_features=gf,
+                                     d2m=d2m,var_map=var_map,T=T_COND)
+                        x0_pred=c_skip*x_t[:,:1]+c_out*D_pred
+                        l_val=hybrid_sigma_loss(x0_pred, residual, sigma_t)
+
+                v_loss+=l_val*fp.shape[0]; vn+=fp.shape[0]
+
+                samples=[]
+                for _ in range(N_ENS):
+                    if TRAIN_MODE=="flow_matching":
+                        x_cond=torch.cat([mu,tc],dim=1)
+                        s=fm.sample(raw,x_cond,topo=tp,global_features=gf,
+                                    d2m=d2m,var_map=var_map,cfg_scale=CFG_SCALE,T=T_COND)+mu
+                    else:
+                        s=ddim_sample(raw,mu,tc,tp,gf,d2m,var_map,edm_schedule,dev)+mu
+                    s=PhysicsGuide.apply(s,xi_raw,enforce_mass=True,enforce_dry=True)
+                    samples.append(s)
+
+                samples_t=torch.stack(samples); best_s=samples_t.mean(0)
+                pcc_sum +=weighted_pcc(best_s,fp,lat_w)
+                crps_sum+=crps_ensemble(samples_t,fp)
+                psd_sum +=psd_tail_ratio(best_s,fp)
+                fss_sum +=fractions_skill_score(best_s,fp,threshold=0.5,window=5)
+                vb+=1
+
+        ema.restore(raw,live_state); model.train()
+
+        if ws>1 and dist.is_initialized():
+            dist.barrier()
+            for t__ in [v_loss,vn]: dist.all_reduce(t__,op=dist.ReduceOp.SUM)
+            dist.barrier()
+
+        vw=(v_loss/vn.clamp(1)).item()
+        wpcc=pcc_sum/max(vb,1); crps_v=crps_sum/max(vb,1)
+        psd_r=psd_sum/max(vb,1); fss_v=fss_sum/max(vb,1)
+        el=time.time()-t0
+
+        if rank==0:
+            star=" ★" if vw < best_val_loss else ""
+            print(f"{ep:>5}|{te_ml:>10.5f}|{vw:>8.4f}|{wpcc:>7.4f}|{crps_v:>8.4f}"
+                  f"|{psd_r:>7.3f}|{fss_v:>6.3f}|{lr_now:>9.2e}"
+                  f"  [{el:.0f}s]{star}")
+
+            ck_base={
+                "epoch":ep,"model_state_dict":raw.state_dict(),
+                "optimizer_state_dict":opt.state_dict(),"ema_shadow":ema.shadow,
+                "val_loss":vw,"wpcc":wpcc,"crps":crps_v,"psd_tail_ratio":psd_r,
+                "no_improve":no_improve,"train_mode":TRAIN_MODE,"sigma_data":SIGMA_DATA,
+                "unet_in_channels":UNET_IN_CH,"t_cond":T_COND,
+                "d2m_channels":UNET_D2M_CH,"var_map_channels":UNET_VAR_MAP_CH,
+                "reg_d2m_channels":REG_D2M_CH,
+            }
+            torch.save(ck_base, LATEST)
+
+            # SAVING LOGIC UPDATED: Now saves based on MINIMUM Validation Loss
+            if vw < best_val_loss:
+                best_val_loss=vw; no_improve=0
+                torch.save(ck_base, SAVE)
+                print(f"  ★ BEST  val_loss={vw:.4f}  wPCC={wpcc:.4f}  "
+                      f"CRPS={crps_v:.4f}  PSD_r={psd_r:.3f}  FSS={fss_v:.3f}")
+                if (ep+1)%50==0:
+                    torch.save(ck_base, os.path.join(
+                        CKPT_DIR,f"unet_{TRAIN_MODE}_ep{ep+1:04d}_loss{vw:.4f}.pth"))
+            else:
+                no_improve+=1
+
+        if no_improve>=PATIENCE:
+            if rank==0: print(f"\n⚠  Early stop ep={ep+1}  best_val_loss={best_val_loss:.4f}")
+            break
+
+    # ── QDM calibration ──────────────────────────────────────────────────────
+    if rank==0:
+        print("\n[QDM] fitting on val set …")
+        qdm=QDM(n_quantiles=1000)
+        ck_best=torch.load(SAVE,map_location=dev)
+        raw.load_state_dict({k.replace("module.",""):v
+                             for k,v in ck_best["model_state_dict"].items()})
+        if "ema_shadow" in ck_best:
+            ema.shadow={k:v.to(dev) for k,v in ck_best["ema_shadow"].items()}
+            ema.apply_to(raw)
+        model.eval(); all_pred,all_obs=[],[]
+        with torch.no_grad():
+            for b in val:
+                fp     =b["fine"].to(dev, non_blocking=True)[:,PRECIP_CH:PRECIP_CH+1]
+                tp     =expand_topo(b["topo"].to(dev, non_blocking=True))
+                gf     =torch.stack([b["doy"],b["hour"]],1).float().to(dev, non_blocking=True)
+                xi_raw =b["coarse"].to(dev, non_blocking=True)
+                var_map=b["var_map"].to(dev, non_blocking=True)
+                d2m    =b["d2m"].to(dev, non_blocking=True) if "d2m" in b else None
+                tc     =build_temporal_cond(b,dev)
+                xi     =build_coarse_input(xi_raw,var_map)
+                mu     =reg(xi,topo=tp,global_features=gf,d2m=d2m)
+                if TRAIN_MODE=="flow_matching":
+                    x_cond=torch.cat([mu,tc],dim=1)
+                    s=fm.sample(raw,x_cond,topo=tp,global_features=gf,
+                                d2m=d2m,var_map=var_map,cfg_scale=CFG_SCALE,T=T_COND)+mu
+                else:
+                    s=ddim_sample(raw,mu,tc,tp,gf,d2m,var_map,edm_schedule,dev)+mu
+                pred=PhysicsGuide.apply(s,xi_raw,enforce_mass=True,enforce_dry=True)
+                all_pred.append(pred.cpu()); all_obs.append(fp.cpu())
+        qdm.fit(torch.cat(all_pred),torch.cat(all_obs))
+        qdm.save(QDM_PATH); print(f"[QDM] saved → {QDM_PATH}")
+
+    if ws>1 and dist.is_initialized(): dist.destroy_process_group()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 13.  INFERENCE
+# ══════════════════════════════════════════════════════════════════════════════
+class CorrDiffInference:
+    def __init__(self, reg_ckpt, unet_ckpt, qdm_ckpt, device,
+                 cfg_scale=CFG_SCALE, n_ens=8):
+        self.dev=device; self.cfg_scale=cfg_scale; self.n_ens=n_ens
+        self.reg=load_regressor(reg_ckpt,device)
+        ck=torch.load(unet_ckpt,map_location=device)
+        tc=ck.get("t_cond",T_COND); self.tc=tc
+        self.train_mode=ck.get("train_mode","flow_matching")
+        self.fm=FlowMatching(n_steps=FM_STEPS,cfg_scale=cfg_scale)
+        self.edm_sched=build_edm_schedule(FM_STEPS,sigma_data=ck.get("sigma_data",SIGMA_DATA))
+        self.unet=UNet(
+            in_channels=ck.get("unet_in_channels",UNET_IN_CH),out_channels=1,
+            base_channels=BASE_CH,channel_mult=CHANNEL_MULT,num_res_blocks=NRB,dropout=0.,
+            global_dim=GLOBAL_DIM,topo_channels=TOPO_CH,use_d2m=True,
+            d2m_channels=ck.get("d2m_channels",UNET_D2M_CH),
+            use_var_map=True,
+            var_map_channels=ck.get("var_map_channels",UNET_VAR_MAP_CH),
+            temporal_frames=tc,
+        ).to(device)
+        state=({k:v.to(device) for k,v in ck["ema_shadow"].items()} if "ema_shadow" in ck
+               else {k.replace("module.",""):v for k,v in ck["model_state_dict"].items()})
+        self.unet.load_state_dict(state); self.unet.eval()
+        self.qdm=QDM.load(qdm_ckpt) if qdm_ckpt and os.path.exists(qdm_ckpt) else None
+
+    @torch.no_grad()
+    def predict(self, coarse, var_map, topo, d2m, doy, hour, tc_frames=None):
+        dev=self.dev
+        coarse=coarse.to(dev); var_map=var_map.to(dev)
+        topo=topo.to(dev); d2m=d2m.to(dev)
+        gf=torch.stack([doy.to(dev),hour.to(dev)],dim=1).float()
+        xi=build_coarse_input(coarse,var_map); tp=expand_topo(topo)
+        if tc_frames is None:
+            coarse_up=F.interpolate(coarse,scale_factor=4,mode='bilinear',align_corners=False)
+            tc_frames=coarse_up.expand(-1,self.tc,-1,-1).to(dev)
+        else:
+            tc_frames=tc_frames.to(dev)
+
+        # regressor
+        mu=self.reg(xi,topo=tp,global_features=gf,d2m=d2m)
+
+        samples=[]
+        for _ in range(self.n_ens):
+            if self.train_mode=="flow_matching":
+                x_cond=torch.cat([mu,tc_frames],dim=1)
+                s=self.fm.sample(self.unet,x_cond,topo=tp,global_features=gf,
+                                 d2m=d2m,var_map=var_map,cfg_scale=self.cfg_scale,T=self.tc)+mu
+            else:
+                s=ddim_sample(self.unet,mu,tc_frames,tp,gf,d2m,var_map,
+                              self.edm_sched,dev)+mu
+            s=PhysicsGuide.apply(s,coarse,enforce_mass=True,enforce_dry=True)
+            if self.qdm is not None: s=self.qdm.apply(s)
+            samples.append(s)
+        samples=torch.stack(samples)
+        return {"mean":samples.mean(0),"std":samples.std(0),"samples":samples,"mu":mu}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--mode",    default=None,choices=["flow_matching","corrdiff_residual"])
+    parser.add_argument("--epochs",  type=int,   default=None)
+    parser.add_argument("--batch",   type=int,   default=None)
+    parser.add_argument("--lr",      type=float, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--patience",type=int,   default=None)
+    args=parser.parse_args()
+    if args.mode     is not None and "TRAIN_MODE" not in os.environ: TRAIN_MODE=args.mode
+    if args.epochs   is not None: EPOCHS=args.epochs
+    if args.batch    is not None: BATCH=args.batch
+    if args.lr       is not None: LR=args.lr
+    if args.dropout  is not None: DROPOUT=args.dropout
+    if args.patience is not None: PATIENCE=args.patience
+    train()
