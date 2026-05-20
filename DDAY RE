@@ -1,0 +1,199 @@
+# -*- coding: utf-8 -*-
+"""
+STAGE 1: Train CorrDiff Regressor (Baseline Predictor)
+=============================================================================
+Predicts the mean state (mu) from coarse data, topology, and atmospheric masks.
+Highly optimized for Multi-GPU, Mixed Precision, and EMA.
+"""
+
+import os
+import time
+import argparse
+import warnings
+from copy import deepcopy
+warnings.filterwarnings("ignore")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+from Dataset import UpscaleDataset
+from Network import CorrDiffRegressor
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+RF_PATH  = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/RF_1975to2023.nc"
+ORO_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/oro.nc"
+D2M_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/era5_aligned_to_rf.nc"
+CKPT_DIR = "checkpoints/regressor"
+
+BATCH        = 32
+ACCUM_STEPS  = 1
+LR           = 2e-4
+MIN_LR       = 1e-6
+EPOCHS       = 1000
+PATIENCE     = 100
+PRECIP_CH    = 0
+EMA_DECAY    = 0.999
+GRAD_CLIP    = 1.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILS & EMA
+# ══════════════════════════════════════════════════════════════════════════════
+class EMA:
+    def __init__(self, model, decay=EMA_DECAY):
+        self.decay  = decay
+        self.shadow = {k: v.clone().detach().float() for k, v in model.state_dict().items()}
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            self.shadow[k].mul_(self.decay).add_(v.detach().float(), alpha=1-self.decay)
+    def apply_to(self, model):
+        model.load_state_dict({k: v.to(next(model.parameters()).device) for k, v in self.shadow.items()})
+    def restore(self, model, state):
+        model.load_state_dict(state)
+
+def setup_ddp():
+    rank = int(os.environ.get("RANK", 0)); ws = int(os.environ.get("WORLD_SIZE", 1))
+    lr_  = int(os.environ.get("LOCAL_RANK", 0))
+    if ws > 1: 
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(lr_)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True   
+    return rank, ws, lr_, torch.device(f"cuda:{lr_}" if torch.cuda.is_available() else "cpu")
+
+def expand_topo(topo_1ch):
+    e = topo_1ch.float()
+    kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=e.device).view(1,1,3,3)
+    ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=e.device).view(1,1,3,3)
+    dx = F.conv2d(e, kx, padding=1); dy = F.conv2d(e, ky, padding=1)
+    slope = torch.sqrt(dx**2 + dy**2 + 1e-8)
+    aspect = torch.atan2(dy, dx)
+    g_n = lambda t, mn, mx: 2 * (t - mn) / (mx - mn + 1e-8) - 1
+    return torch.cat([g_n(e,0,8600), g_n(slope,0,1.5), aspect/3.14159], dim=1)
+
+def build_coarse_input(coarse, var_map):
+    Hc, Wc = coarse.shape[-2], coarse.shape[-1]
+    return torch.cat([coarse, F.adaptive_avg_pool2d(var_map, (Hc, Wc))], dim=1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+def train_regressor():
+    rank, ws, lr_, dev = setup_ddp()
+    if rank == 0: os.makedirs(CKPT_DIR, exist_ok=True)
+    
+    ds = UpscaleDataset(RF_PATH, ORO_PATH, d2m_file=D2M_PATH, split="train", normalize=True, device="cpu")
+    n = len(ds); trn = int(0.70*n); van = int(0.10*n)
+    
+    loader_kwargs = dict(num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    trl = DataLoader(Subset(ds, range(0, trn)), BATCH, shuffle=True, drop_last=True, **loader_kwargs)
+    val = DataLoader(Subset(ds, range(trn, trn+van)), BATCH, shuffle=False, **loader_kwargs)
+
+    model = CorrDiffRegressor(
+        in_channels=2, out_channels=1, base_channels=64, channel_mult=(1, 2, 4), 
+        num_blocks=2, global_dim=2, topo_channels=3, d2m_channels=1, use_d2m=True
+    ).to(dev)
+
+    if ws > 1: model = nn.parallel.DistributedDataParallel(model, device_ids=[lr_])
+    raw = model.module if ws > 1 else model
+    ema = EMA(raw, decay=EMA_DECAY)
+    
+    opt = AdamW(model.parameters(), lr=LR, weight_decay=1e-3)
+    scaler = GradScaler(device=dev.type)
+    sched = CosineAnnealingWarmRestarts(opt, T_0=50, T_mult=1, eta_min=MIN_LR)
+
+    best_val_loss = float('inf')
+    no_improve = 0
+    SAVE_PATH = os.path.join(CKPT_DIR, "regressor_best.pth")
+
+    if rank == 0: print(f"[STAGE 1] Regressor Training | Eff. Batch: {BATCH*ACCUM_STEPS*ws} | LR: {LR}")
+
+    for ep in range(EPOCHS):
+        model.train()
+        sum_loss = nb = 0.
+        opt.zero_grad(set_to_none=True)
+        t0 = time.time()
+
+        for step, b in enumerate(trl, 1):
+            fp = b["fine"].to(dev, non_blocking=True)[:, PRECIP_CH:PRECIP_CH+1]
+            xi_raw = b["coarse"].to(dev, non_blocking=True)
+            d2m = b["d2m"].to(dev, non_blocking=True)
+            var_map = b["var_map"].to(dev, non_blocking=True)
+            tp = expand_topo(b["topo"].to(dev, non_blocking=True))
+            gf = torch.stack([b["doy"], b["hour"]], 1).float().to(dev, non_blocking=True)
+            
+            xi = build_coarse_input(xi_raw, var_map)
+
+            with autocast(device_type=dev.type):
+                mu = model(xi, topo=tp, global_features=gf, d2m=d2m)
+                # Charbonnier / Smooth L1 is best for regressor stability
+                loss = F.smooth_l1_loss(mu, fp, beta=0.1) / ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+
+            if step % ACCUM_STEPS == 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(opt); scaler.update()
+                opt.zero_grad(set_to_none=True)
+                ema.update(raw)
+            
+            sum_loss += loss.item() * ACCUM_STEPS; nb += 1
+
+        sched.step()
+        train_loss = torch.tensor(sum_loss / max(nb, 1), device=dev)
+        if ws > 1: dist.all_reduce(train_loss); train_loss /= ws
+
+        # ── VALIDATION ──
+        live_state = deepcopy(raw.state_dict()); ema.apply_to(raw); model.eval()
+        v_loss = torch.tensor(0., device=dev); vn = torch.tensor(0, device=dev, dtype=torch.long)
+        
+        with torch.no_grad():
+            for b in val:
+                fp = b["fine"].to(dev, non_blocking=True)[:, PRECIP_CH:PRECIP_CH+1]
+                xi_raw = b["coarse"].to(dev, non_blocking=True)
+                d2m = b["d2m"].to(dev, non_blocking=True)
+                var_map = b["var_map"].to(dev, non_blocking=True)
+                tp = expand_topo(b["topo"].to(dev, non_blocking=True))
+                gf = torch.stack([b["doy"], b["hour"]], 1).float().to(dev, non_blocking=True)
+                xi = build_coarse_input(xi_raw, var_map)
+
+                with autocast(device_type=dev.type):
+                    mu = raw(xi, topo=tp, global_features=gf, d2m=d2m)
+                    l_val = F.l1_loss(mu, fp)
+
+                v_loss += l_val * fp.shape[0]; vn += fp.shape[0]
+
+        ema.restore(raw, live_state); model.train()
+        if ws > 1: dist.all_reduce(v_loss); dist.all_reduce(vn)
+        vw = (v_loss / vn.clamp(1)).item()
+        
+        if rank == 0:
+            star = " ★" if vw < best_val_loss else ""
+            print(f"Ep {ep:03d} | Train L1: {train_loss.item():.4f} | Val L1: {vw:.4f} | LR: {opt.param_groups[0]['lr']:.2e} | {time.time()-t0:.0f}s{star}")
+            
+            if vw < best_val_loss:
+                best_val_loss = vw; no_improve = 0
+                torch.save({
+                    "model_state_dict": raw.state_dict(),
+                    "reg_in_channels": 2, "d2m_channels": 1, "use_d2m": True
+                }, SAVE_PATH)
+            else:
+                no_improve += 1
+                
+        if no_improve >= PATIENCE:
+            if rank == 0: print(f"Early stop at ep {ep}. Best Val: {best_val_loss:.4f}")
+            break
+
+    if ws > 1: dist.destroy_process_group()
+
+if __name__ == "__main__":
+    train_regressor()
