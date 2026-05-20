@@ -1,0 +1,183 @@
+# -*- coding: utf-8 -*-
+"""
+Production Dataset Loader for CorrDiff/Flow-Matching (V11 Architecture)
+Engineered for IITM Pune H100 Cluster Environments.
+Features: In-RAM caching, Mass-Conserving Downscaling, Dynamic Variance Maps.
+"""
+
+import os
+import gc
+import warnings
+import numpy as np
+import pandas as pd
+import xarray as xr
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+warnings.filterwarnings("ignore")
+
+class UpscaleDataset(Dataset):
+    PRECIP_NAMES = ['rf', 'RF', 'pr', 'tp', 'precip', 'precipitation']
+    
+    def __init__(
+        self, 
+        nc_file, 
+        oro_file, 
+        d2m_file=None, 
+        downscale_factor=4,
+        normalize=True, 
+        device="cpu", 
+        split='train', 
+        t_cond=5
+    ):
+        super().__init__()
+        self.split = split
+        self.downscale = downscale_factor
+        self.log_transformed = normalize
+        self.has_d2m = d2m_file is not None and os.path.exists(d2m_file)
+        self.t_cond = t_cond
+
+        print(f"[{split.upper()}] Mounting NetCDF pipelines into RAM...")
+        
+        # ── 1. LOAD DATASETS ──
+        ds = xr.open_dataset(nc_file, engine="netcdf4" if nc_file.endswith('.nc') else "h5netcdf")
+        ds_oro = xr.open_dataset(oro_file, engine="netcdf4")
+        
+        # Ensure consistent spatial sorting (South-North, West-East)
+        for dataset in [ds, ds_oro]:
+            lat = next((c for c in dataset.coords if c.lower() in ['lat', 'latitude']), None)
+            lon = next((c for c in dataset.coords if c.lower() in ['lon', 'longitude']), None)
+            if lat and lon:
+                dataset = dataset.sortby([lat, lon])
+
+        # ── 2. PROCESS STATIC TOPOGRAPHY ──
+        topo = np.nan_to_num(ds_oro['topology'].values.astype(np.float32), nan=0.0)
+        self.topo_mean, self.topo_std = topo.mean(), topo.std() + 1e-8
+        if normalize: 
+            topo = (topo - self.topo_mean) / self.topo_std
+
+        # ── 3. PROCESS DYNAMIC ATMOSPHERIC MASK (D2M) ──
+        if self.has_d2m:
+            ds_d2m = xr.open_dataset(d2m_file, engine="netcdf4")
+            d2m_var = list(ds_d2m.data_vars)[0]
+            d2m_raw = np.nan_to_num(ds_d2m[d2m_var].values.astype(np.float32), nan=0.0)
+            
+            # Collapse arbitrary dimensions (e.g., ensemble/batch)
+            if d2m_raw.ndim == 4: 
+                d2m_raw = d2m_raw[:, 0]
+            
+            # Auto-detect Kelvin and convert to Celsius for numerical stability
+            if d2m_raw.mean() > 100: 
+                d2m_raw -= 273.15 
+                
+            self.d2m_mean, self.d2m_std = float(np.nanmean(d2m_raw)), float(np.nanstd(d2m_raw) + 1e-8)
+            if normalize: 
+                d2m_raw = (d2m_raw - self.d2m_mean) / self.d2m_std
+
+        # ── 4. PROCESS PRECIPITATION ──
+        found_precip = next(
+            (v for v in ds.data_vars if any(k.lower() in v.lower() for k in self.PRECIP_NAMES)), 
+            list(ds.data_vars)[0]
+        )
+        data = ds[found_precip].values
+        # Clip negative precipitation artifacts safely
+        data = np.clip(np.nan_to_num(data.astype(np.float32), nan=0.0), a_min=0.0, a_max=None)
+
+        # ── 5. TEMPORAL METADATA ──
+        dt = pd.to_datetime(ds["TIME"].values if "TIME" in ds else ds["time"].values)
+        self.doy = torch.tensor(dt.dayofyear.values / 366.0, dtype=torch.float32)
+        self.hour = torch.tensor(dt.hour.values / 24.0, dtype=torch.float32)
+
+        # ── 6. CROP TO UNET MULTIPLES (16x16 boundaries) ──
+        H_raw, W_raw = data.shape[1], data.shape[2]
+        H, W = (H_raw // 16) * 16, (W_raw // 16) * 16
+        
+        data = data[:, :H, :W]
+        topo = topo[:H, :W]
+        if self.has_d2m: 
+            d2m_raw = d2m_raw[:, :H, :W]
+
+        self.H, self.W, self.T = H, W, data.shape[0]
+        self.topo_tensor = torch.from_numpy(topo).unsqueeze(0).contiguous()
+        if self.has_d2m: 
+            self.d2m_tensor = torch.from_numpy(d2m_raw).unsqueeze(1).contiguous()
+
+        # Free memory before tensor duplication
+        del ds, ds_oro
+        if self.has_d2m: del ds_d2m, d2m_raw
+        gc.collect()
+
+        # ── 7. STRICT MASS-CONSERVATION POOLING ──
+        print(f"[{split.upper()}] Executing structural downscaling & log-transforms...")
+        fine_all, coarse_all = [], []
+        chunk_size = 64  # Prevents OOM spikes on heavy CPU RAM
+        
+        for i in range(0, self.T, chunk_size):
+            chunk = torch.from_numpy(data[i : i + chunk_size]).unsqueeze(1)
+            
+            # F.avg_pool2d mathematically conserves the physical volume of water
+            coarse = F.avg_pool2d(
+                chunk, 
+                kernel_size=self.downscale, 
+                stride=self.downscale
+            )
+            
+            if self.log_transformed:
+                # log1p handles the heavy-tail distribution of monsoon extremes
+                chunk = torch.log1p(chunk)
+                coarse = torch.log1p(coarse)
+                
+            fine_all.append(chunk)
+            coarse_all.append(coarse)
+
+        self.fine = torch.cat(fine_all).contiguous()
+        self.coarse = torch.cat(coarse_all).contiguous()
+        del data, fine_all, coarse_all
+        gc.collect()
+
+        # ── 8. CLIMATOLOGICAL VARIANCE MAP ──
+        # Computes the temporal variance of the coarse data (v11 requirement)
+        print(f"[{split.upper()}] Computing structural variance map...")
+        var_map = np.nan_to_num(np.var(self.coarse[:, 0].numpy(), axis=0), nan=0.0)
+        vmin, vmax = var_map.min(), var_map.max()
+        if vmax - vmin > 1e-7:
+            var_map = (var_map - vmin) / (vmax - vmin)
+        else:
+            var_map = np.zeros_like(var_map)
+            
+        self.var_map_tensor = torch.from_numpy(var_map).float().unsqueeze(0).contiguous()
+        
+        print(f"[{split.upper()}] Ready. Loaded {self.T} frames.")
+        print(f"    Fine res: {self.H}x{self.W} | Coarse res: {self.H // self.downscale}x{self.W // self.downscale}")
+
+    def __len__(self): 
+        return self.T
+
+    def __getitem__(self, idx):
+        # ── ASSEMBLE TEMPORAL HISTORY BLOCK (T_COND) ──
+        start_idx = idx - self.t_cond + 1
+        
+        if start_idx < 0:
+            # Replicate the first available frame if hitting the boundary
+            padding = self.coarse[0:1].repeat(abs(start_idx), 1, 1, 1)
+            actual_frames = self.coarse[0 : idx + 1]
+            tc_frames = torch.cat([padding, actual_frames], dim=0).squeeze(1)
+        else:
+            tc_frames = self.coarse[start_idx : idx + 1].squeeze(1)
+
+        # ── PACKAGE V11 TENSORS ──
+        out = {
+            "fine": self.fine[idx],                     # [1, H, W]
+            "coarse": self.coarse[idx],                 # [1, H/4, W/4]
+            "tc_frames": tc_frames,                     # [T_COND, H/4, W/4]
+            "topo": self.topo_tensor,                   # [1, H, W]
+            "var_map": self.var_map_tensor,             # [1, H/4, W/4]
+            "doy": self.doy[idx],                       # Scalar
+            "hour": self.hour[idx],                     # Scalar
+        }
+        
+        if self.has_d2m: 
+            out["d2m"] = self.d2m_tensor[idx]           # [1, H, W]
+            
+        return out
