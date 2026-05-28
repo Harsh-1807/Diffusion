@@ -1,0 +1,828 @@
+import os
+import numpy as np
+import torch
+import torch.nn.functional as F
+import xarray as xr
+import pandas as pd
+import warnings
+from Network import UNet, CorrDiffRegressor, QDM, PhysicsGuide
+
+warnings.filterwarnings("ignore")
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+COARSE_25KM_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/RF_1975to2023.nc"
+ORO_PATH         = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/oro.nc"
+D2M_PATH         = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/era5_aligned_to_rf.nc"
+REG_PATH         = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/SET1/checkpoints/regressor/regressor_best.pth"
+DIFF_PATH        = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/SET1/checkpoints/v12_wassdiff_edm_facl/unet_edm_wassdiff_sigma0.217_best.pth"
+QDM_PATH         = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/SET1/checkpoints/v12_wassdiff_edm_facl/qdm_edm_wassdiff.pth"
+OUT_DIR          = "DATASET"
+
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE   = 8
+T_COND       = 5
+UNET_IN      = 1 + 1 + T_COND
+SIGMA_DATA   = 0.2171
+N_STEPS      = 25
+K_ENSEMBLE   = 4
+CFG_SCALE    = 1.5
+SCALE_FACTOR = 4
+SEED         = 42
+
+PRECIP_KEYWORDS = ['rf','RF','rainfall','RAINFALL','precipitation','PRECIPITATION',
+                   'pr','PR','tp','TP','total_precipitation','prec','PREC','rain','RAIN','precip','PRECIP']
+
+class InferenceDataset(torch.utils.data.Dataset):
+    def __init__(self, nc_file, oro_file, d2m_file, scale_factor=4):
+        self.scale_factor = scale_factor
+        ds = xr.open_dataset(nc_file)
+        var_name = next((v for v in ds.data_vars if any(k.lower() in v.lower() for k in PRECIP_KEYWORDS)), None)
+        if var_name is None:
+            raise ValueError(f"No precip var in {nc_file}")
+        data = np.clip(np.nan_to_num(ds[var_name].values.astype(np.float32), nan=0.0), 0, None)
+        H_c, W_c = (data.shape[1]//4)*4, (data.shape[2]//4)*4
+        data = data[:, :H_c, :W_c]
+        self.Hc, self.Wc = H_c, W_c
+        self.Hf, self.Wf = H_c*scale_factor, W_c*scale_factor
+        data = np.log1p(data)
+        self.coarse = torch.from_numpy(data).unsqueeze(1).contiguous()
+        time_var = next((t for t in ds.coords if t.upper() in ['TIME','TIMES','T']), 'TIME')
+        self.times = pd.to_datetime(ds[time_var].values)
+        self.doy  = torch.tensor(self.times.dayofyear.values/366.0, dtype=torch.float32)
+        self.hour = torch.tensor(self.times.hour.values/24.0,       dtype=torch.float32)
+        var_map = np.var(data, axis=0)
+        vmin, vmax = var_map.min(), var_map.max()
+        if vmax-vmin > 1e-7: var_map = (var_map-vmin)/(vmax-vmin+1e-8)
+        self.var_map = torch.from_numpy(var_map).float().unsqueeze(0).contiguous()
+        ds_oro   = xr.open_dataset(oro_file)
+        topo_var = next((v for v in ds_oro.data_vars if 'topo' in v.lower() or 'elev' in v.lower()), list(ds_oro.data_vars)[0])
+        topo = np.nan_to_num(ds_oro[topo_var].values.astype(np.float32), nan=0.0)
+        topo = (topo-topo.mean())/(topo.std()+1e-8)
+        self.topo = torch.from_numpy(topo).unsqueeze(0).unsqueeze(0).contiguous()
+        ds_d2m  = xr.open_dataset(d2m_file)
+        d2m_var = next((v for v in ds_d2m.data_vars if 'd2m' in v.lower() or 'dew' in v.lower()), list(ds_d2m.data_vars)[0])
+        d2m = ds_d2m[d2m_var].values.astype(np.float32)
+        if d2m.ndim==4: d2m = d2m[:,0]
+        d2m = np.nan_to_num(d2m, nan=0.0)
+        if d2m.mean()>100: d2m -= 273.15
+        d2m = (d2m-float(np.nanmean(d2m)))/(float(np.nanstd(d2m))+1e-8)
+        self.d2m = torch.from_numpy(d2m).unsqueeze(1).contiguous()
+
+    def __len__(self): return self.coarse.shape[0]
+
+    def __getitem__(self, idx):
+        return {"coarse": self.coarse[idx], "topo": self.topo[0],
+                "d2m": self.d2m[idx], "var_map": self.var_map,
+                "doy": self.doy[idx], "hour": self.hour[idx]}
+
+
+def build_edm_schedule(n_steps, sigma_min=0.002, sigma_data=SIGMA_DATA, rho=7.0):
+    sigma_max = 2.0*sigma_data
+    steps = torch.arange(n_steps, dtype=torch.float32)/max(n_steps-1,1)
+    return (sigma_max**(1/rho)+steps*(sigma_min**(1/rho)-sigma_max**(1/rho)))**rho
+
+def compute_slope_aspect(elev):
+    kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=elev.device).view(1,1,3,3)
+    ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=elev.device).view(1,1,3,3)
+    e=elev.float(); dx=F.conv2d(e,kx,padding=1); dy=F.conv2d(e,ky,padding=1)
+    slope=torch.sqrt(dx**2+dy**2+1e-8); aspect=torch.atan2(dy,dx)
+    def norm(t): mn=t.amin(); mx=t.amax(); return 2*(t-mn)/(mx-mn+1e-8)-1
+    return torch.cat([norm(e),norm(slope),norm(aspect)],dim=1)
+
+def expand_topo(t): return torch.cat([compute_slope_aspect(t[i:i+1]) for i in range(t.shape[0])],dim=0)
+
+def build_coarse_input(coarse, var_map):
+    return torch.cat([coarse, F.adaptive_avg_pool2d(var_map,(coarse.shape[-2],coarse.shape[-1]))],dim=1)
+
+@torch.no_grad()
+def ddim_sample(model, mu, tc, tp, gf, d2m, var_map, sched, dev):
+    x_t = torch.randn_like(mu)*SIGMA_DATA
+    sigmas = sched.to(dev)
+    for i, sigma_cur in enumerate(sigmas):
+        s=sigma_cur.view(1,1,1,1)
+        c_in=1./torch.sqrt(s**2+SIGMA_DATA**2)
+        c_out=s*SIGMA_DATA/torch.sqrt(s**2+SIGMA_DATA**2)
+        c_skip=SIGMA_DATA**2/(s**2+SIGMA_DATA**2)
+        c_n=(sigma_cur.log()/4).expand(mu.shape[0])
+        D=model(c_in*torch.cat([x_t,mu,tc],dim=1),c_n,topo=tp,global_features=gf,d2m=d2m,var_map=var_map,T=T_COND)
+        x0=c_skip*x_t[:,:1]+c_out*D
+        if i<len(sigmas)-1:
+            sn=sigmas[i+1].view(1,1,1,1)
+            x_t=x0+sn*(x_t-x0)/s.clamp(1e-8)
+        else: x_t=x0
+    return x_t
+
+
+class CorrDiffInference:
+    def __init__(self, reg_ckpt, unet_ckpt, qdm_ckpt, device, n_ens=4):
+        self.dev=device; self.n_ens=n_ens
+        ck_r=torch.load(reg_ckpt,map_location=device)
+        self.reg=CorrDiffRegressor(in_channels=2,out_channels=1,base_channels=64,
+                                   channel_mult=(1,2,4),num_blocks=2,global_dim=2,
+                                   topo_channels=3,d2m_channels=1,use_d2m=True).to(device)
+        self.reg.load_state_dict(ck_r.get("model_state_dict",ck_r),strict=False)
+        self.reg.eval()
+        ck_u=torch.load(unet_ckpt,map_location=device)
+        self.tc=ck_u.get("t_cond",T_COND)
+        self.sched=build_edm_schedule(N_STEPS,sigma_data=ck_u.get("sigma_data",SIGMA_DATA))
+        self.unet=UNet(in_channels=ck_u.get("unet_in_channels",UNET_IN),out_channels=1,
+                       base_channels=160,channel_mult=(1,2,2,4),num_res_blocks=3,dropout=0.,
+                       global_dim=2,topo_channels=3,use_d2m=True,d2m_channels=1,
+                       use_var_map=True,var_map_channels=1,temporal_frames=self.tc).to(device)
+        state=(({k:v.to(device) for k,v in ck_u["ema_shadow"].items()}) if "ema_shadow" in ck_u
+               else {k.replace("module.",""):v for k,v in ck_u["model_state_dict"].items()})
+        self.unet.load_state_dict(state,strict=False); self.unet.eval()
+        self.qdm=QDM.load(qdm_ckpt) if qdm_ckpt and os.path.exists(qdm_ckpt) else None
+
+    @torch.no_grad()
+    def predict(self, coarse, var_map, topo, d2m, doy, hour, tc_frames):
+        dev=self.dev
+        coarse,var_map,topo,d2m=coarse.to(dev),var_map.to(dev),topo.to(dev),d2m.to(dev)
+        tc_frames=tc_frames.to(dev)
+        gf=torch.stack([doy.to(dev),hour.to(dev)],dim=1).float()
+        xi=build_coarse_input(coarse,var_map); tp=expand_topo(topo)
+        with torch.autocast(device_type=dev.type,dtype=torch.bfloat16):
+            mu=self.reg(xi,topo=tp,global_features=gf,d2m=d2m)
+            samples=[PhysicsGuide.apply(ddim_sample(self.unet,mu,tc_frames,tp,gf,d2m,var_map,self.sched,dev)+mu,
+                                        coarse,enforce_mass=True,enforce_dry=True) for _ in range(self.n_ens)]
+            mean_pred=torch.stack(samples).float().mean(0)
+            if self.qdm is not None and self.qdm._fitted:
+                mean_pred=self.qdm.apply(mean_pred)
+        return mean_pred
+
+
+def build_tc_batch(dataset, indices, Hf, Wf):
+    out=[]
+    for idx in indices:
+        frames=[F.interpolate(dataset.coarse[max(0,idx-k)].unsqueeze(0).float(),(Hf,Wf),mode='bilinear',align_corners=False)
+                for k in range(T_COND,0,-1)]
+        out.append(torch.cat(frames,dim=1))
+    return torch.cat(out,dim=0)
+
+def save_year(yr, preds, times, lats, lons):
+    arr=np.concatenate(preds,axis=0)
+    ds=xr.Dataset({"precipitation":(["time","latitude","longitude"],arr)},
+                  coords={"time":np.array(times),"latitude":lats,"longitude":lons})
+    ds["precipitation"].attrs.update({"units":"mm","long_name":"CorrDiff 6.25km Rainfall"})
+    path=os.path.join(OUT_DIR,f"corrdiff_6km_{yr}.nc")
+    ds.to_netcdf(path,encoding={"precipitation":{"zlib":True,"complevel":5}})
+
+def main():
+    torch.manual_seed(SEED); np.random.seed(SEED)
+    os.makedirs(OUT_DIR,exist_ok=True)
+    ds=InferenceDataset(COARSE_25KM_PATH,ORO_PATH,D2M_PATH)
+    with xr.open_dataset(COARSE_25KM_PATH) as dc:
+        lat_n=next((c for c in dc.coords if c.lower() in ['lat','latitude','lat_degrees']),None)
+        lon_n=next((c for c in dc.coords if c.lower() in ['lon','longitude','lon_degrees']),None)
+        if lat_n is None or lon_n is None: raise ValueError("No lat/lon coords found")
+        lats=np.linspace(dc[lat_n].values[0],dc[lat_n].values[-1],ds.Hf)
+        lons=np.linspace(dc[lon_n].values[0],dc[lon_n].values[-1],ds.Wf)
+    inferencer=CorrDiffInference(REG_PATH,DIFF_PATH,QDM_PATH,DEVICE)
+    cur_yr=None; yr_preds=[]; yr_times=[]
+    indices = list(range(0, int(0.2 * len(ds))))
+    for b_start in range(0,len(indices),BATCH_SIZE):
+        batch=indices[b_start:b_start+BATCH_SIZE]
+        b_c,b_t,b_d,b_dy,b_hr,b_vm=[],[],[],[],[],[]
+        for i in batch:
+            bv=ds[i]
+            b_c.append(bv["coarse"])
+            b_t.append(F.interpolate(bv["topo"].unsqueeze(0).float(),(ds.Hf,ds.Wf),mode='bilinear')[0])
+            b_d.append(F.interpolate(bv["d2m"].unsqueeze(0).float(),(ds.Hf,ds.Wf),mode='bilinear')[0])
+            b_dy.append(bv["doy"]); b_hr.append(bv["hour"]); b_vm.append(bv["var_map"])
+        preds=inferencer.predict(torch.stack(b_c),torch.stack(b_vm),torch.stack(b_t),
+                                 torch.stack(b_d),torch.stack(b_dy),torch.stack(b_hr),
+                                 build_tc_batch(ds,batch,ds.Hf,ds.Wf))
+        preds_np=np.maximum(np.expm1(preds.squeeze(1).cpu().numpy()),0.0)
+        for b_idx,ds_idx in enumerate(batch):
+            t=ds.times[ds_idx]; yr=t.year
+            if cur_yr is not None and yr!=cur_yr:
+                save_year(cur_yr,yr_preds,yr_times,lats,lons)
+                yr_preds=[]; yr_times=[]
+            cur_yr=yr
+            yr_preds.append(np.expand_dims(preds_np[b_idx],0))
+            yr_times.append(t)
+    if yr_preds: save_year(cur_yr,yr_preds,yr_times,lats,lons)
+
+if __name__=="__main__":
+    main()   # -*- coding: utf-8 -*-
+"""
+Generate 25 km Downscaled Precipitation — TEST SET (Year-wise)
+HARDENED VERSION: Zero lat/lon mismatch guaranteed.
+"""
+
+import os
+import argparse
+import warnings
+import math
+import time
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import xarray as xr
+from torch.utils.data import DataLoader, Subset
+
+from Dataset import UpscaleDataset
+from Network import CorrDiffRegressor, UNet, PhysicsGuide, QDM
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSTANTS  (must match train-time)
+# ═══════════════════════════════════════════════════════════════════════════
+SIGMA_DATA   = 0.2171
+T_COND       = 5
+PRECIP_CH    = 0
+BASE_CH      = 160
+CHANNEL_MULT = (1, 2, 2, 4)
+NRB          = 3
+GLOBAL_DIM   = 2
+TOPO_CH      = 3
+REG_IN_CH    = 2
+REG_D2M_CH   = 1
+UNET_D2M_CH  = 1
+UNET_VAR_MAP_CH = 1
+UNET_IN_CH   = 1 + 1 + T_COND
+DS_FACTOR    = 4
+
+RF_PATH  = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/RF_1975to2023.nc"
+ORO_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/oro.nc"
+D2M_PATH = "/lustre/home/hpc/bipink/VIT_Pune_New/Harsh/Diffusion_Downscaling/data/era5_aligned_to_rf.nc"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SAFE COORDINATE EXTRACTOR  ← central fix for all mismatch bugs
+# ═══════════════════════════════════════════════════════════════════════════
+def extract_lat_lon_from_dataset(ds_full: UpscaleDataset, rf_path: str) -> tuple:
+    """
+    Extract lat/lon arrays that are GUARANTEED to match the spatial grid
+    used inside UpscaleDataset — i.e. after sortby + crop to (H//16)*16.
+
+    Returns
+    -------
+    lat_vals : np.ndarray  shape [H]
+    lon_vals : np.ndarray  shape [W]
+    """
+    H, W = ds_full.H, ds_full.W
+
+    ds_raw = xr.open_dataset(rf_path, engine="netcdf4")
+
+    # Mirror Dataset.py: auto-detect coord names
+    lat_name = next(
+        (c for c in ds_raw.coords if c.lower() in ["lat", "latitude"]), None
+    )
+    lon_name = next(
+        (c for c in ds_raw.coords if c.lower() in ["lon", "longitude"]), None
+    )
+    if lat_name is None or lon_name is None:
+        raise RuntimeError(
+            f"Cannot find lat/lon in {rf_path}. "
+            f"Available coords: {list(ds_raw.coords)}"
+        )
+
+    # Mirror Dataset.py: sort ascending
+    ds_raw = ds_raw.sortby([lat_name, lon_name])
+
+    lat_vals = ds_raw[lat_name].values[:H].astype(np.float64)
+    lon_vals = ds_raw[lon_name].values[:W].astype(np.float64)
+    ds_raw.close()
+
+    # Sanity: lengths must match dataset spatial dims
+    assert len(lat_vals) == H, (
+        f"lat length {len(lat_vals)} != dataset H={H}. "
+        "Crop mismatch between Dataset.py and coord extraction."
+    )
+    assert len(lon_vals) == W, (
+        f"lon length {len(lon_vals)} != dataset W={W}. "
+        "Crop mismatch between Dataset.py and coord extraction."
+    )
+
+    print(f"[COORDS] lat: {lat_vals[0]:.4f} → {lat_vals[-1]:.4f}  (n={H})")
+    print(f"[COORDS] lon: {lon_vals[0]:.4f} → {lon_vals[-1]:.4f}  (n={W})")
+    return lat_vals, lon_vals
+
+
+def extract_timestamps_from_dataset(ds_full: UpscaleDataset, rf_path: str,
+                                     test_idx: list) -> pd.DatetimeIndex:
+    """
+    Extract timestamps for the test subset using the SAME variable name
+    logic as Dataset.py (looks for 'TIME', then falls back).
+    """
+    ds_raw = xr.open_dataset(rf_path, engine="netcdf4")
+
+    # Find time dimension — Dataset.py uses ds["TIME"]
+    time_candidates = ["TIME", "time", "Time"]
+    time_name = next((c for c in time_candidates if c in ds_raw), None)
+    if time_name is None:
+        # last resort: use the first dimension of the first data variable
+        first_var = list(ds_raw.data_vars)[0]
+        time_name = ds_raw[first_var].dims[0]
+        print(f"[WARN] No 'TIME'/'time' found; using dim '{time_name}' as time axis.")
+
+    all_times = pd.to_datetime(ds_raw[time_name].values)
+    ds_raw.close()
+
+    test_times = all_times[test_idx]
+    print(f"[TIMESTAMPS] Test period: {test_times[0].date()} → {test_times[-1].date()}"
+          f"  (n={len(test_times)})")
+    return test_times
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EDM SCHEDULE
+# ═══════════════════════════════════════════════════════════════════════════
+def build_edm_schedule(n_steps, sigma_min=0.002, sigma_data=SIGMA_DATA, rho=7.0):
+    sigma_max = 2.0 * sigma_data
+    steps     = torch.arange(n_steps, dtype=torch.float32) / max(n_steps - 1, 1)
+    return (sigma_max**(1/rho) + steps*(sigma_min**(1/rho) - sigma_max**(1/rho)))**rho
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOPO HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_slope_aspect(elev, global_elev_max=8600.0, global_slope_max=1.5):
+    kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                      dtype=torch.float32, device=elev.device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                      dtype=torch.float32, device=elev.device).view(1, 1, 3, 3)
+    e      = elev.float()
+    dx     = F.conv2d(e, kx, padding=1)
+    dy     = F.conv2d(e, ky, padding=1)
+    slope  = torch.sqrt(dx**2 + dy**2 + 1e-8)
+    aspect = torch.atan2(dy, dx)
+    def global_norm(t, g_min, g_max):
+        return 2 * (t - g_min) / (g_max - g_min + 1e-8) - 1
+    return torch.cat([
+        global_norm(e,     0.0, global_elev_max),
+        global_norm(slope, 0.0, global_slope_max),
+        aspect / math.pi,
+    ], dim=1)
+
+
+def expand_topo(topo_1ch):
+    return torch.cat(
+        [compute_slope_aspect(topo_1ch[i:i+1]) for i in range(topo_1ch.shape[0])],
+        dim=0)
+
+
+def build_coarse_input(coarse, var_map):
+    Hc, Wc = coarse.shape[-2], coarse.shape[-1]
+    return torch.cat([coarse, F.adaptive_avg_pool2d(var_map, (Hc, Wc))], dim=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEMPORAL CONDITIONING
+# ═══════════════════════════════════════════════════════════════════════════
+def build_temporal_cond(batch, dev, n_frames=T_COND):
+    if "tc_frames" in batch:
+        tc = batch["tc_frames"].to(dev, non_blocking=True)
+        tc = F.interpolate(tc, scale_factor=4, mode='bilinear', align_corners=False)
+        if tc.shape[1] >= n_frames:
+            return tc[:, :n_frames]
+        pad = torch.zeros(tc.shape[0], n_frames - tc.shape[1],
+                          *tc.shape[2:], device=dev)
+        return torch.cat([tc, pad], dim=1)
+    coarse    = batch["coarse"].to(dev, non_blocking=True)
+    coarse_up = F.interpolate(coarse, scale_factor=4, mode='bilinear',
+                              align_corners=False)
+    return coarse_up.expand(-1, n_frames, -1, -1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODEL LOADERS
+# ═══════════════════════════════════════════════════════════════════════════
+def load_regressor(ckpt_path, dev):
+    ck  = torch.load(ckpt_path, map_location=dev)
+    reg = CorrDiffRegressor(
+        in_channels   = ck.get("reg_in_channels", REG_IN_CH),
+        out_channels  = 1,
+        base_channels = 64,
+        channel_mult  = (1, 2, 4),
+        num_blocks    = 2,
+        global_dim    = GLOBAL_DIM,
+        topo_channels = TOPO_CH,
+        d2m_channels  = ck.get("d2m_channels", REG_D2M_CH),
+        use_d2m       = ck.get("use_d2m", True),
+    ).to(dev)
+    state = {k.replace("module.", ""): v
+             for k, v in ck["model_state_dict"].items()}
+    reg.load_state_dict(state)
+    reg.eval()
+    for p in reg.parameters():
+        p.requires_grad_(False)
+    return reg
+
+
+def load_unet(ckpt_path, dev):
+    ck = torch.load(ckpt_path, map_location=dev)
+    tc = ck.get("t_cond", T_COND)
+    unet = UNet(
+        in_channels      = ck.get("unet_in_channels", UNET_IN_CH),
+        out_channels     = 1,
+        base_channels    = BASE_CH,
+        channel_mult     = CHANNEL_MULT,
+        num_res_blocks   = NRB,
+        dropout          = 0.0,
+        global_dim       = GLOBAL_DIM,
+        topo_channels    = TOPO_CH,
+        use_d2m          = True,
+        d2m_channels     = ck.get("d2m_channels", UNET_D2M_CH),
+        use_var_map      = True,
+        var_map_channels = ck.get("var_map_channels", UNET_VAR_MAP_CH),
+        temporal_frames  = tc,
+    ).to(dev)
+    if "ema_shadow" in ck:
+        state = {k: v.to(dev) for k, v in ck["ema_shadow"].items()}
+    else:
+        state = {k.replace("module.", ""): v
+                 for k, v in ck["model_state_dict"].items()}
+    unet.load_state_dict(state)
+    unet.eval()
+    for p in unet.parameters():
+        p.requires_grad_(False)
+    return unet, tc
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DDIM SAMPLER
+# ═══════════════════════════════════════════════════════════════════════════
+@torch.no_grad()
+def ddim_sample(unet, mu, tc, tp, gf, d2m, var_map,
+                edm_schedule, dev, autocast_dtype=torch.bfloat16):
+    B      = mu.shape[0]
+    x_t    = torch.randn_like(mu) * SIGMA_DATA
+    sigmas = edm_schedule.to(dev)
+
+    # ── FIX: clone mu so CUDA Graph replay cannot overwrite it ──
+    mu = mu.clone()
+
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        for i, sigma_cur in enumerate(sigmas):
+            s_cur   = sigma_cur.view(1, 1, 1, 1)
+            c_in    = 1. / torch.sqrt(s_cur**2 + SIGMA_DATA**2)
+            c_out   = s_cur * SIGMA_DATA / torch.sqrt(s_cur**2 + SIGMA_DATA**2)
+            c_skip  = SIGMA_DATA**2 / (s_cur**2 + SIGMA_DATA**2)
+            c_n     = (sigma_cur.log() / 4).expand(B)
+            x_in    = torch.cat([x_t, mu, tc], dim=1)
+            D_pred  = unet(c_in * x_in, c_n, topo=tp,
+                           global_features=gf, d2m=d2m,
+                           var_map=var_map, T=T_COND)
+            x0_hat  = c_skip * x_t[:, :1] + c_out * D_pred
+            if i < len(sigmas) - 1:
+                sigma_next = sigmas[i + 1].view(1, 1, 1, 1)
+                x_t = x0_hat + sigma_next * (x_t - x0_hat) / s_cur.clamp(min=1e-8)
+            else:
+                x_t = x0_hat
+    return x_t.float()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# METRICS  (real space)
+# ═══════════════════════════════════════════════════════════════════════════
+def to_real(x_log):
+    return torch.expm1(x_log.clamp(min=0.)).clamp(min=0.)
+
+def real_pcc(pred_r, obs_r):
+    B  = pred_r.shape[0]
+    p  = pred_r.view(B, -1).float()
+    o  = obs_r.view(B, -1).float()
+    pm = p.mean(1, keepdim=True);  om = o.mean(1, keepdim=True)
+    num   = ((p - pm) * (o - om)).sum(1)
+    denom = (torch.sqrt(((p - pm)**2).sum(1)) *
+             torch.sqrt(((o - om)**2).sum(1)) + 1e-8)
+    return (num / denom).mean().item()
+
+def real_rmse(pred_r, obs_r):
+    return torch.sqrt(F.mse_loss(pred_r.float(), obs_r.float())).item()
+
+def real_bias(pred_r, obs_r):
+    return (pred_r.float().mean() - obs_r.float().mean()).item()
+
+def fractions_skill_score(pred, target, threshold=5.0, window=5):
+    p_bin  = (pred  > threshold).float()
+    t_bin  = (target > threshold).float()
+    p_frac = F.avg_pool2d(p_bin,  window, stride=1, padding=window // 2)
+    t_frac = F.avg_pool2d(t_bin,  window, stride=1, padding=window // 2)
+    mse    = ((p_frac - t_frac)**2).mean(dim=[-1, -2])
+    ref    = (p_frac**2).mean(dim=[-1, -2]) + (t_frac**2).mean(dim=[-1, -2])
+    return (1.0 - mse / (ref + 1e-8)).mean().item()
+
+def crps_ensemble(samples, target):
+    N   = samples.shape[0]
+    mae = (samples - target.unsqueeze(0)).abs().mean(0)
+    pair = (samples.unsqueeze(0) - samples.unsqueeze(1)).abs()
+    return (mae - 0.5 / N / (N - 1) * pair.sum([0, 1])).mean().item()
+
+def psd_tail_ratio(pred, target, hff=0.3):
+    P = torch.fft.rfft2(pred.float()).abs()
+    T = torch.fft.rfft2(target.float()).abs()
+    c = int((1 - hff) * P.shape[-1])
+    return (P[..., c:].mean() / (T[..., c:].mean() + 1e-8)).item()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TEST INDEX LOGIC
+# ═══════════════════════════════════════════════════════════════════════════
+def get_test_indices(dataset_total, train_frac=0.70, val_frac=0.10):
+    n = dataset_total
+    test_size = int(0.20 * n)
+    # Testing indices are the first 20%
+    return list(range(0, test_size))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN INFERENCE
+# ═══════════════════════════════════════════════════════════════════════════
+def run_inference(args):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {dev}  |  "
+          f"CUDA: {torch.cuda.get_device_name(0) if dev.type == 'cuda' else 'N/A'}")
+
+    torch.backends.cudnn.benchmark            = True
+    torch.backends.cuda.matmul.allow_tf32     = True
+    torch.backends.cudnn.allow_tf32           = True
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # ── Load dataset (CPU) ────────────────────────────────────────────────
+    print("[INFO] Loading dataset …")
+    ds_full = UpscaleDataset(
+        RF_PATH, ORO_PATH,
+        d2m_file  = D2M_PATH,
+        split     = "test",
+        normalize = True,
+        device    = "cpu",
+    )
+    N_total  = len(ds_full)
+    test_idx = get_test_indices(N_total,
+                                train_frac=args.train_frac,
+                                val_frac=args.val_frac)
+    print(f"[INFO] Dataset total={N_total}  test={len(test_idx)}"
+          f"  [{test_idx[0]}..{test_idx[-1]}]")
+
+    # ── Extract coordinates THE SAME WAY Dataset.py does ─────────────────
+    #    This is the single source of truth for lat/lon in all saved NetCDFs
+    lat_vals, lon_vals = extract_lat_lon_from_dataset(ds_full, RF_PATH)
+
+    # ── Extract timestamps ────────────────────────────────────────────────
+    test_times     = extract_timestamps_from_dataset(ds_full, RF_PATH, test_idx)
+    test_years_arr = test_times.year.values
+    test_years     = sorted(set(test_years_arr))
+    print(f"[INFO] Test years: {test_years}")
+
+    # ── Load models ───────────────────────────────────────────────────────
+    print("[INFO] Loading regressor …")
+    reg = load_regressor(args.reg_ckpt, dev)
+
+    print("[INFO] Loading UNet …")
+    unet, tc_from_ckpt = load_unet(args.unet_ckpt, dev)
+
+    if args.compile:
+        print("[INFO] Compiling models …")
+        reg  = torch.compile(reg,  mode="reduce-overhead")
+        unet = torch.compile(unet, mode="reduce-overhead")
+
+    qdm = None
+    if args.qdm_ckpt and os.path.exists(args.qdm_ckpt):
+        print(f"[INFO] Loading QDM from {args.qdm_ckpt}")
+        qdm = QDM.load(args.qdm_ckpt)
+
+    edm_schedule = build_edm_schedule(args.edm_steps)
+
+    # ── DataLoader ────────────────────────────────────────────────────────
+    test_subset = Subset(ds_full, test_idx)
+    loader = DataLoader(
+        test_subset,
+        batch_size        = args.batch,
+        shuffle           = False,   # ORDER MATTERS — never shuffle
+        num_workers       = 8,
+        pin_memory        = True,
+        persistent_workers= True,
+        prefetch_factor   = 2,
+        drop_last         = False,
+    )
+
+    H, W = ds_full.H, ds_full.W
+
+    # Verify spatial dims match extracted coords (belt-and-suspenders)
+    assert H == len(lat_vals), f"Spatial H={H} != lat array len={len(lat_vals)}"
+    assert W == len(lon_vals), f"Spatial W={W} != lon array len={len(lon_vals)}"
+
+    # ── Inference loop ────────────────────────────────────────────────────
+    all_pred_log = []
+    all_obs_log  = []
+    all_samples  = []
+
+    print("[INFO] Running inference …")
+    t0 = time.time()
+    processed = 0
+
+    with torch.no_grad():
+        for bi, batch in enumerate(loader):
+            fp      = batch["fine"].to(dev, non_blocking=True)[:, PRECIP_CH:PRECIP_CH+1]
+            topo_1c = batch["topo"].to(dev, non_blocking=True)
+            xi_raw  = batch["coarse"].to(dev, non_blocking=True)
+            var_map = batch["var_map"].to(dev, non_blocking=True)
+            d2m     = batch["d2m"].to(dev, non_blocking=True) if "d2m" in batch else None
+            gf      = torch.stack([batch["doy"], batch["hour"]], 1).float().to(dev, non_blocking=True)
+            tc_inp  = build_temporal_cond(batch, dev, n_frames=T_COND)
+            tp      = expand_topo(topo_1c)
+            xi      = build_coarse_input(xi_raw, var_map)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                mu = reg(xi, topo=tp, global_features=gf, d2m=d2m)
+
+            # ── FIX: clone once here so each ensemble member gets a clean copy ──
+            mu_base = mu.clone()
+
+            ens_samples = []
+            for _ in range(args.n_ens):
+                res_sample = ddim_sample(
+                    unet, mu_base, tc_inp, tp, gf, d2m, var_map,
+                    edm_schedule, dev, autocast_dtype=torch.bfloat16,
+                )
+                pred_log = mu_base.clone() + res_sample   # mu_base reused safely
+                pred_log = PhysicsGuide.apply(pred_log, xi_raw,
+                                              enforce_mass=True, enforce_dry=True)
+                if qdm is not None:
+                    pred_log = qdm.apply(pred_log)
+                ens_samples.append(pred_log.cpu())
+
+            ens_t         = torch.stack(ens_samples)       # [N_ens, B, 1, H, W]
+            mean_pred_log = ens_t.mean(0)
+
+            all_pred_log.append(mean_pred_log)
+            all_obs_log.append(fp.cpu())
+            all_samples.append(ens_t)
+
+            processed += fp.shape[0]
+            if (bi + 1) % 20 == 0:
+                elapsed = time.time() - t0
+                print(f"  [{processed}/{len(test_idx)}]  "
+                      f"{processed / elapsed:.1f} samples/s")
+
+    print(f"[INFO] Inference done in {time.time() - t0:.1f}s")
+
+    pred_log_all = torch.cat(all_pred_log, dim=0)   # [N_test, 1, H, W]
+    obs_log_all  = torch.cat(all_obs_log,  dim=0)
+    samples_all  = torch.cat(all_samples,  dim=1)   # [N_ens, N_test, 1, H, W]
+
+    pred_real_all = to_real(pred_log_all)
+    obs_real_all  = to_real(obs_log_all)
+    samples_real  = to_real(samples_all)
+
+    # Verify output spatial shape matches coordinates exactly
+    assert pred_real_all.shape[-2] == H, \
+        f"Pred H={pred_real_all.shape[-2]} != coord H={H}"
+    assert pred_real_all.shape[-1] == W, \
+        f"Pred W={pred_real_all.shape[-1]} != coord W={W}"
+
+    # ── Year-wise NetCDF + metrics ────────────────────────────────────────
+    all_metrics = []
+
+    for yr in test_years:
+        mask = (test_years_arr == yr)
+        n_yr = mask.sum()
+        print(f"\n[Year {yr}]  n_samples={n_yr}")
+
+        pr = pred_real_all[mask]        # [n_yr, 1, H, W]
+        ob = obs_real_all[mask]
+        sp = samples_real[:, mask]      # [N_ens, n_yr, 1, H, W]
+
+        yr_times = test_times[mask]
+
+        pred_np = pr.squeeze(1).numpy().astype(np.float32)   # [n_yr, H, W]
+        obs_np  = ob.squeeze(1).numpy().astype(np.float32)
+
+        # Verify spatial shape one more time before writing
+        assert pred_np.shape[1] == len(lat_vals), \
+            f"[{yr}] pred H={pred_np.shape[1]} != lat len={len(lat_vals)}"
+        assert pred_np.shape[2] == len(lon_vals), \
+            f"[{yr}] pred W={pred_np.shape[2]} != lon len={len(lon_vals)}"
+
+        ds_out = xr.Dataset(
+            {
+                "precipitation_predicted": (
+                    ["time", "lat", "lon"], pred_np,
+                    {"units": "mm/day",
+                     "long_name": "CorrDiff 25km downscaled precipitation"},
+                ),
+                "precipitation_observed": (
+                    ["time", "lat", "lon"], obs_np,
+                    {"units": "mm/day",
+                     "long_name": "IMD 25km observed precipitation"},
+                ),
+            },
+            coords={
+                "time": yr_times.values,
+                "lat":  lat_vals,          # ← same sort+crop as Dataset.py
+                "lon":  lon_vals,          # ← same sort+crop as Dataset.py
+            },
+            attrs={
+                "description": f"CorrDiff 25km downscaled precipitation — {yr}",
+                "model":       "CorrDiff EDM Residual v12 WassDiff",
+                "sigma_data":  SIGMA_DATA,
+                "n_ensemble":  args.n_ens,
+                "edm_steps":   args.edm_steps,
+                "qdm_applied": str(qdm is not None),
+                "lat_source":  f"RF_PATH sortby+crop to H={H}",
+                "lon_source":  f"RF_PATH sortby+crop to W={W}",
+            },
+        )
+
+        nc_path = os.path.join(args.out_dir, f"corrdiff_25km_{yr}.nc")
+        ds_out.to_netcdf(nc_path, encoding={
+            "precipitation_predicted": {"zlib": True, "complevel": 4, "dtype": "float32"},
+            "precipitation_observed":  {"zlib": True, "complevel": 4, "dtype": "float32"},
+        })
+        print(f"  Saved → {nc_path}")
+
+        pcc  = real_pcc(pr, ob)
+        rmse = real_rmse(pr, ob)
+        bias = real_bias(pr, ob)
+        fss5 = fractions_skill_score(pr, ob, threshold=5.0,  window=5)
+        fss20= fractions_skill_score(pr, ob, threshold=20.0, window=5)
+        psd  = psd_tail_ratio(pr, ob)
+        crps = crps_ensemble(sp, ob)
+
+        obs_flat  = ob.flatten().numpy()
+        pred_flat = pr.flatten().numpy()
+
+        all_metrics.append({
+            "year":      yr,
+            "n_samples": int(n_yr),
+            "PCC_real":  round(pcc,  4),
+            "RMSE_real": round(rmse, 4),
+            "Bias_real": round(bias, 4),
+            "FSS_5mm":   round(fss5, 4),
+            "FSS_20mm":  round(fss20, 4),
+            "PSD_tail":  round(psd,  4),
+            "CRPS_real": round(crps, 4),
+            "P95_obs":   round(float(np.percentile(obs_flat,  95)), 3),
+            "P95_pred":  round(float(np.percentile(pred_flat, 95)), 3),
+            "P99_obs":   round(float(np.percentile(obs_flat,  99)), 3),
+            "P99_pred":  round(float(np.percentile(pred_flat, 99)), 3),
+        })
+        print(f"  PCC={pcc:.4f}  RMSE={rmse:.4f}  Bias={bias:.4f}  "
+              f"FSS5={fss5:.4f}  FSS20={fss20:.4f}  CRPS={crps:.4f}")
+
+    # ── Overall metrics ───────────────────────────────────────────────────
+    pcc_all  = real_pcc(pred_real_all, obs_real_all)
+    rmse_all = real_rmse(pred_real_all, obs_real_all)
+    bias_all = real_bias(pred_real_all, obs_real_all)
+    fss5_all = fractions_skill_score(pred_real_all, obs_real_all, threshold=5.0,  window=5)
+    fss20_all= fractions_skill_score(pred_real_all, obs_real_all, threshold=20.0, window=5)
+    psd_all  = psd_tail_ratio(pred_real_all, obs_real_all)
+    crps_all = crps_ensemble(samples_real, obs_real_all)
+
+    obs_all_flat  = obs_real_all.flatten().numpy()
+    pred_all_flat = pred_real_all.flatten().numpy()
+
+    all_metrics.append({
+        "year":      "ALL",
+        "n_samples": int(pred_real_all.shape[0]),
+        "PCC_real":  round(pcc_all,  4),
+        "RMSE_real": round(rmse_all, 4),
+        "Bias_real": round(bias_all, 4),
+        "FSS_5mm":   round(fss5_all, 4),
+        "FSS_20mm":  round(fss20_all, 4),
+        "PSD_tail":  round(psd_all,  4),
+        "CRPS_real": round(crps_all, 4),
+        "P95_obs":   round(float(np.percentile(obs_all_flat,  95)), 3),
+        "P95_pred":  round(float(np.percentile(pred_all_flat, 95)), 3),
+        "P99_obs":   round(float(np.percentile(obs_all_flat,  99)), 3),
+        "P99_pred":  round(float(np.percentile(pred_all_flat, 99)), 3),
+    })
+
+    df       = pd.DataFrame(all_metrics)
+    csv_path = os.path.join(args.out_dir, "metrics_yearwise.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\n[METRICS] Saved → {csv_path}")
+    print(df.to_string(index=False))
+    print(f"\n[DONE]  Overall PCC (real) = {pcc_all:.4f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Year-wise 25km downscaling inference — CorrDiff v12 WassDiff (hardened)")
+
+    parser.add_argument("--reg_ckpt",   required=True)
+    parser.add_argument("--unet_ckpt",  required=True)
+    parser.add_argument("--qdm_ckpt",   default=None)
+    parser.add_argument("--out_dir",    default="outputs/25km_test")
+    parser.add_argument("--batch",      type=int,   default=16)
+    parser.add_argument("--n_ens",      type=int,   default=8)
+    parser.add_argument("--edm_steps",  type=int,   default=6)
+    parser.add_argument("--train_frac", type=float, default=0.70)
+    parser.add_argument("--val_frac",   type=float, default=0.10)
+    parser.add_argument("--compile",    action="store_true")
+
+    args = parser.parse_args()
+    run_inference(args)
+    
