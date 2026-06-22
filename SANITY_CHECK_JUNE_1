@@ -1,0 +1,67 @@
+Your message duplicated the same four pieces twice (Dataset.py, the v13 architecture file, and the inference script all appear twice), so I'm working from one copy of each. I actually ran the two complete files (Dataset.py, inference script) through the interpreter rather than just eyeballing them — here's what's real and what isn't.
+
+**1. The "process_split scope bug" — false alarm, no fix needed**
+
+I compiled the inference script exactly as you pasted it. `process_split` is defined and called correctly inside `run_inference()` — the `cal_obs, _, cal_ens = process_split(...)` block is at the same 4-space indent as the `def process_split` line, both nested inside the function. `py_compile` confirms no syntax/scope error. Whatever flagged this was looking at an older draft — this version is fine.
+
+**2. QDM calibration — also correct, no fix needed**
+
+Fitting the QDM on `cal_obs`/`cal_ens_mean` from a held-out calibration split (not train/val, not test) and applying it only to `tst_ens` is the right procedure. That's not leakage — it's literally what the cal split exists for.
+
+**3. The actual bug — log-space/physical-space mismatch, exactly the thing the review flagged generically**
+
+```python
+xi_raw = F.avg_pool2d(fp, kernel_size=DS_FACTOR, stride=DS_FACTOR)   # fp is ALREADY log1p
+xi = build_coarse_input(xi_raw, var_map)
+```
+
+`fp = b["fine"]` comes out of `UpscaleDataset` already `log1p`-transformed. Averaging in log-space and treating that as "coarse precip" is wrong — your own `Dataset.py` does it correctly (avg-pool in mm, *then* `log1p`), but the inference script re-derives `xi_raw` from log-space `fp` instead of just using `b["coarse"]` (which was already pooled correctly). `build_temporal_cond` even uses `batch["coarse"]` correctly two lines later — so this is an inconsistency, not a deliberate choice.
+
+The size of the effect is not cosmetic. Concave-function averaging (Jensen's inequality) means `log1p(mean(x))` and `mean(log1p(x))` diverge fastest exactly when rain is patchy — common at convective-scale precip:
+
+```
+4x4 patch, one 40mm pixel, rest dry:
+correct (avg-then-log) → 2.50 mm  in physical space
+wrong   (log-then-avg) → 0.26 mm  in physical space   (~10x too low)
+```
+
+That's the same shape of error as your long-standing mean-underprediction problem (~1.93 vs ~6.36 mm/day). `xi_raw` then feeds both the regressor's `mu` *and* `PhysicsGuide`'s mass-conservation target — so PhysicsGuide could be actively pulling your fine output toward an artificially low coarse value. Fix:
+
+```python
+xi_raw = b["coarse"].to(DEVICE)        # use the dataset's correctly-pooled coarse field
+xi = build_coarse_input(xi_raw, var_map)
+```
+
+I'd check your (pending) training script for the same pattern before you start a run — if training also recomputes coarse via `avg_pool2d` on log-space fine data anywhere, you're baking this bias into the weights themselves, not just inference.
+
+**4. `topo_channels=3` is fake — only ever fed duplicated elevation**
+
+```python
+def expand_topo(topo_1ch):
+    return torch.cat([topo_1ch, topo_1ch, topo_1ch], dim=1)  # "Simplified... placeholder"
+```
+
+`Dataset.py` only ever loads `ds_oro['topology']` — one channel. No slope, no aspect, anywhere in the dataset. So every FiLM layer that expects "elev/slope/aspect" (per your own v13 docstring) has actually been getting elevation copy-pasted three times — slope and aspect have never been real signals in this model. The conv weights on those two extra channels are pure noise/redundancy. Two ways to resolve before training:
+
+- **Quick**: drop to `topo_channels=1` everywhere, delete `expand_topo`, accept elevation-only FiLM conditioning for now.
+- **Correct**: compute real slope/aspect once in `Dataset.py` from the elevation grid and cache them, e.g.:
+```python
+def compute_slope_aspect(topo_2d, dy=1.0, dx=1.0):
+    dzdy, dzdx = np.gradient(topo_2d, dy, dx)
+    slope  = np.sqrt(dzdx**2 + dzdy**2)
+    aspect = np.arctan2(-dzdx, dzdy)
+    return slope, aspect
+```
+normalize slope/aspect independently of elevation, stack into a real 3-channel `topo_tensor`, and drop `expand_topo` from inference entirely (since `b["topo"]` would already be 3-channel). Given rain-shadow/orographic effects matter for downscaling in your domain, I'd lean toward this option rather than the quick one — but it's your call given how much time you have before the run.
+
+**5. Worth a sanity check, not necessarily a bug: temporal conditioning is one frame, broadcast 5x**
+
+```python
+def build_temporal_cond(batch, dev, n_frames=T_COND):
+    coarse = batch["coarse"].to(dev)
+    return F.interpolate(coarse, scale_factor=4, mode='bilinear').expand(-1, n_frames, -1, -1)
+```
+
+`.expand()` just broadcasts the *same* single timestep into `T_COND=5` identical channels — there's no actual t-1, t-2... history here, and `UpscaleDataset.__getitem__` only ever returns one timestep anyway. `TemporalAttention` in the UNet has nothing genuinely temporal to attend over right now (all "frames" are identical), so it can only learn a fixed transform of a single frame, not real temporal dynamics. If this is intentional scaffolding for a future multi-frame dataset, fine — but if you expect TemporalAttention to be doing real work in v13, it currently can't.
+
+**What I couldn't check**: the pasted `HybridNetwork_v13.py` cuts off mid-`UNet._temb`, before `UNet.forward`, `Diffusion` (EDM `c_in/c_out/c_skip/c_noise`, sigma sampling, Heun sampler), and `PhysicsGuide`. Those are the pieces that actually determine whether the EDM math and the soft physics correction are right — and `PhysicsGuide` interacts directly with the `xi_raw` bug above. If you want a real pass on those, paste the full file (or the training script once it's ready) and I'll go through them the same way — actually compiled/tested, not just read.
