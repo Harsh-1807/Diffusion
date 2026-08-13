@@ -1,0 +1,22 @@
+
+Computing summary metrics...
+
+--- Summary metrics (June 1995) ---
+{'dataset': 'GT', 'domain_mean_mm_day': 5.785080393347449, 'spatial_std_mm_day': 18.95773983881348, 'p95_mm_day': 36.482666397094704, 'p99_mm_day': 91.94178215026812, 'max_mm_day': 1396.1007080078125, 'wet_day_frac_pct': 100.0}
+{'dataset': 'Diffusion Mean', 'domain_mean_mm_day': 7.24069969743357, 'spatial_std_mm_day': 24.84317935140496, 'p95_mm_day': 46.7132591549497, 'p99_mm_day': 122.59912413193943, 'max_mm_day': 1569.8632168264598, 'wet_day_frac_pct': 100.0}
+
+Diffusion Mean vs GT: Bias=1.456 mm/day, RMSE=5.836 mm/day, UnbiasedRMSE=5.652 mm/day, Corr=0.583, R2=0.339
+Spread-skill correlation (std vs |error|): 0.645
+Domain-mean Gaussian-approx CRPS: 3.105 mm/day
+Taylor diagram: normalized std = 1.342, pattern corr = 0.583
+
+FSS (averaged over June days):
+  >1 mm/day: 1px=0.515, 3px=0.554, 5px=0.580, 9px=0.623, 15px=0.672, 21px=0.709, 31px=0.756
+  >10 mm/day: 1px=0.376, 3px=0.419, 5px=0.449, 9px=0.500, 15px=0.562, 21px=0.611, 31px=0.674
+  >25 mm/day: 1px=0.272, 3px=0.315, 5px=0.347, 9px=0.402, 15px=0.469, 21px=0.525, 31px=0.596
+
+Contingency scores (pooled over all days/pixels):
+  >1 mm/day: POD=0.498 FAR=0.444 CSI=0.357
+  >10 mm/day: POD=0.395 FAR=0.617 CSI=0.241
+  >25 mm/day: POD=0.310 FAR=0.737 CSI=0.166
+  >50 mm/day: POD=0.224 FAR=0.841 CSI=0.102
